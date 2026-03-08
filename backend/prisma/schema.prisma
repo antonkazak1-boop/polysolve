@@ -1,0 +1,384 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Market {
+  id              String   @id @default(uuid())
+  conditionId     String   @unique
+  question        String
+  description     String?
+  category        String
+  endDate         DateTime
+  resolutionSource String?
+  liquidity       Float    @default(0)
+  volume          Float    @default(0)
+  status          String   // OPEN, CLOSED, RESOLVED, DISPUTED
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  prices          MarketPrice[]
+  bets            Bet[]
+  positions       PortfolioPosition[]
+  alerts          Alert[]
+  signals         StrategySignal[]
+
+  @@index([status])
+  @@index([category])
+  @@index([endDate])
+  @@map("markets")
+}
+
+model MarketPrice {
+  id              String   @id @default(uuid())
+  marketId        String
+  outcome         String   // YES or NO
+  price           Float    // 0-1
+  timestamp       DateTime @default(now())
+  liquidity       Float    @default(0)
+  volume24h       Float?
+
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([marketId, timestamp])
+  @@index([timestamp])
+  @@map("market_prices")
+}
+
+model Wallet {
+  id              String   @id @default(uuid())
+  address         String   @unique
+  totalBets       Int      @default(0)
+  totalVolume     Float    @default(0)
+  totalPnl        Float    @default(0)
+  averageRoi      Float    @default(0) // Главная метрика!
+  winRate         Float    @default(0)
+  lastActiveAt    DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  bets            Bet[]
+  alerts          Alert[]
+
+  @@index([averageRoi])
+  @@index([totalPnl])
+  @@map("wallets")
+}
+
+model Bet {
+  id              String   @id @default(uuid())
+  walletId        String
+  marketId        String
+  outcome         String   // YES or NO
+  amount          Float
+  price           Float    // Цена входа
+  potentialRoi    Float    // (1 / price) - 1
+  status          String   // ACTIVE, WON, LOST, CANCELLED
+  pnl             Float?
+  roi             Float?   // Фактический ROI после закрытия
+  timestamp       DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  wallet          Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  position        PortfolioPosition?
+
+  @@index([walletId])
+  @@index([marketId])
+  @@index([status])
+  @@index([timestamp])
+  @@map("bets")
+}
+
+model PortfolioPosition {
+  id              String   @id @default(uuid())
+  userId          String?  // Для мультипользовательской системы
+  marketId        String
+  betId           String?  @unique
+  outcome         String   // YES or NO
+  amount          Float
+  entryPrice      Float
+  currentPrice    Float?
+  potentialPnl    Float?
+  potentialRoi    Float?
+  status          String   // ACTIVE, WON, LOST, CANCELLED
+  entryTime       DateTime
+  marketEndDate   DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  bet             Bet?     @relation(fields: [betId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([status])
+  @@index([entryTime])
+  @@map("portfolio_positions")
+}
+
+model PortfolioSnapshot {
+  id              String   @id @default(uuid())
+  userId          String?
+  totalBalance    Float
+  totalInvested   Float
+  totalPnl        Float
+  totalRoi        Float
+  activePositions Int
+  wonPositions    Int
+  lostPositions   Int
+  timestamp       DateTime @default(now())
+
+  @@index([userId, timestamp])
+  @@index([timestamp])
+  @@map("portfolio_snapshots")
+}
+
+model Alert {
+  id              String   @id @default(uuid())
+  type            String   // ARBITRAGE, ASYMMETRIC_RETURNS, NEW_BET, etc.
+  strategy        String
+  marketId        String?
+  walletId        String?
+  message         String
+  confidence      Int      // 0-100
+  data            String   @default("{}") // Дополнительные данные (JSON как строка для SQLite)
+  read            Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  market          Market?  @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  wallet          Wallet?  @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([type])
+  @@index([read])
+  @@index([createdAt])
+  @@map("alerts")
+}
+
+model DemoBalance {
+  id        String   @id @default("demo")
+  balance   Float    @default(10000)
+  updatedAt DateTime @updatedAt
+
+  @@map("demo_balance")
+}
+
+model DemoTrade {
+  id             String   @id @default(uuid())
+  eventId        String
+  eventTitle     String
+  marketId       String
+  marketQuestion String
+  outcome        String   // YES or NO
+  amount         Float
+  entryPrice     Float
+  exitPrice      Float?
+  currentPrice   Float?
+  pnl            Float?
+  roi            Float?
+  status         String   // OPEN, CLOSED_WIN, CLOSED_LOSS, CLOSED_MANUAL
+  tags           String   @default("[]") // JSON array of tag labels
+  openedAt       DateTime @default(now())
+  closedAt       DateTime?
+  updatedAt      DateTime @updatedAt
+
+  @@index([status])
+  @@index([openedAt])
+  @@map("demo_trades")
+}
+
+// Local cache for trader profiles (positions + trades stats)
+// Written when a wallet profile is opened; used by leaderboard to avoid repeated API calls
+model TraderCache {
+  address        String   @id                  // lowercase proxy wallet address
+  userName       String?
+  positionsCount Int      @default(0)
+  tradesCount    Int      @default(0)
+  avgTradeSize   Float    @default(0)
+  positions      String   @default("[]")       // JSON: WalletPosition[]
+  recentTrades   String   @default("[]")       // JSON: WalletTrade[]
+  fetchedAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([updatedAt])
+  @@map("trader_cache")
+}
+
+// Wallets the user is watching / tracking
+model WatchedWallet {
+  id            String   @id @default(uuid())
+  address       String   @unique
+  label         String?  // custom user label
+  userName      String?  // from Polymarket
+  pnl           Float?   // last known PnL
+  vol           Float?   // last known volume
+  rank          String?  // leaderboard rank
+  notes         String?
+  addedAt       DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([address])
+  @@map("watched_wallets")
+}
+
+// Bookmarked convergence markets (where multiple smart wallets agree)
+model WatchedConvergence {
+  id          String   @id @default(uuid())
+  marketId    String   @unique
+  title       String
+  eventSlug   String?
+  notes       String?
+  // Snapshot at bookmark time
+  consensus   String?  // YES | NO | SPLIT
+  walletCount Int?
+  avgEntryPrice Float?
+  addedAt     DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([marketId])
+  @@index([addedAt])
+  @@map("watched_convergence")
+}
+
+// History of convergence signals for win-rate tracking
+model ConvergenceHistory {
+  id            String   @id @default(uuid())
+  marketId      String
+  title         String
+  eventSlug     String?
+  consensus     String   // YES | NO | SPLIT at time of detection
+  consensusPct  Int      // 50-100
+  walletCount   Int      // how many wallets converged
+  wallets       String   // JSON: [{address, userName, outcome, value, entryPrice}]
+  totalValue    Float    // combined position value
+  avgEntryPrice Float    // weighted avg
+  detectedAt    DateTime @default(now())
+  
+  // Resolution (filled later when market closes)
+  resolved      Boolean  @default(false)
+  resolvedAt    DateTime?
+  winningOutcome String? // YES | NO | null if SPLIT/unresolved
+  won           Boolean? // true if consensus matched winning outcome
+  actualYesPrice Float?   // 0-1 at resolution
+  
+  @@index([marketId])
+  @@index([detectedAt])
+  @@index([resolved])
+  @@index([won])
+  @@map("convergence_history")
+}
+
+// Large trade alert (whale activity > $10K)
+model WhaleAlert {
+  id             String   @id @default(uuid())
+  // Trade identity
+  tradeId        String?  @unique  // external trade ID from Data API
+  walletAddress  String
+  marketId       String
+  eventId        String?
+  eventTitle     String
+  marketQuestion String
+  // Trade details
+  side           String   // BUY_YES | BUY_NO | SELL_YES | SELL_NO
+  outcome        String   // YES | NO
+  tradeType      String   // BUY | SELL
+  amount         Float    // USD value of trade
+  shares         Float    // number of shares
+  price          Float    // price per share at trade time
+  // Classification
+  pattern        String   @default("LARGE_BET") // LARGE_BET | ACCUMULATION | EXIT | REVERSAL | COPY_TRADE
+  significance   String   @default("HIGH")      // HIGH | CRITICAL
+  // Wallet context
+  walletName     String?  // display name from leaderboard or API
+  walletPnl      Float?   // wallet's historical PnL from leaderboard
+  walletProfit   Float?
+  isTopTrader    Boolean  @default(false)        // in top-100 leaderboard
+  // Metadata
+  tradedAt       DateTime
+  detectedAt     DateTime @default(now())
+
+  @@index([walletAddress])
+  @@index([marketId])
+  @@index([pattern])
+  @@index([tradedAt])
+  @@index([detectedAt])
+  @@map("whale_alerts")
+}
+
+// Tracks every generated signal + its eventual outcome for accuracy measurement
+model SignalRecord {
+  id             String   @id @default(uuid())
+  // Signal identity
+  marketId       String
+  eventId        String
+  eventTitle     String
+  marketQuestion String
+  side           String   // YES | NO
+  horizon        String   // fast | medium | long
+  category       String
+  anomalyTypes   String   @default("[]") // JSON string[]
+  reasons        String   @default("[]") // JSON string[]
+  // Confidence & price at signal time
+  confidence     Int
+  confidenceLevel String  // strong | good | speculative
+  entryPrice     Float
+  potentialRoi   Float
+  // Outcome (filled in by cron after market resolves)
+  outcome        String   @default("PENDING") // PENDING | WIN | LOSS | VOID
+  resolvedAt     DateTime?
+  exitPrice      Float?   // price when market resolved
+  actualRoi      Float?   // realized ROI if held to resolution
+  // CLV (closing line value)
+  closingPrice   Float?   // price of our side shortly before resolution
+  clvCents       Float?   // (closingPrice - entryPrice) * 100; positive = edge
+  // Metadata
+  generatedAt    DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  snapshots      SignalPriceSnapshot[]
+
+  @@index([outcome])
+  @@index([horizon])
+  @@index([category])
+  @@index([generatedAt])
+  @@index([marketId])
+  @@map("signal_records")
+}
+
+model SignalPriceSnapshot {
+  id             String   @id @default(uuid())
+  signalRecordId String
+  ourSidePrice   Float
+  snapshotAt     DateTime @default(now())
+
+  signal         SignalRecord @relation(fields: [signalRecordId], references: [id], onDelete: Cascade)
+
+  @@index([signalRecordId, snapshotAt])
+  @@map("signal_price_snapshots")
+}
+
+model StrategySignal {
+  id              String   @id @default(uuid())
+  strategy        String
+  marketId        String
+  signal          String   // BUY_YES, BUY_NO, SELL
+  confidence      Int      // 0-100
+  potentialRoi    Float?
+  reasoning       String
+  data            String   @default("{}") // JSON как строка для SQLite
+  createdAt       DateTime @default(now())
+
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([strategy])
+  @@index([marketId])
+  @@index([createdAt])
+  @@map("strategy_signals")
+}
