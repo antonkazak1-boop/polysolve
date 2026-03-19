@@ -1,6 +1,6 @@
 #!/bin/bash
 # PolySolve — Start Script
-# Запускает backend (port 3002) и frontend (port 3006)
+# Запускает backend (port 3002) и frontend (port 3000)
 
 set -e
 
@@ -23,6 +23,7 @@ echo ""
 echo "→ Stopping any existing processes..."
 # Kill by port
 lsof -ti:3002 2>/dev/null | xargs kill -9 2>/dev/null && echo "  Killed port 3002" || true
+lsof -ti:3000 2>/dev/null | xargs kill -9 2>/dev/null && echo "  Killed port 3000" || true
 lsof -ti:3006 2>/dev/null | xargs kill -9 2>/dev/null && echo "  Killed port 3006" || true
 # Kill zombie tsx/npm dev processes from polysolve
 pkill -f "polysolve.*tsx" 2>/dev/null || true
@@ -59,16 +60,17 @@ done
 
 # ── Frontend ───────────────────────────────────────────────────────────────────
 echo ""
-echo "→ Starting frontend on http://localhost:3006 ..."
+echo "→ Starting frontend on http://localhost:3000 ..."
 cd "$FRONTEND"
-npm run dev -- --port 3006 > /tmp/polysolve-frontend.log 2>&1 &
+rm -rf .next
+npm run dev > /tmp/polysolve-frontend.log 2>&1 &
 FRONTEND_PID=$!
 echo "  PID: $FRONTEND_PID | Log: /tmp/polysolve-frontend.log"
 
 # Wait for frontend to be ready
 echo "  Waiting for frontend..."
 for i in $(seq 1 30); do
-  if curl -s http://localhost:3006 > /dev/null 2>&1; then
+  if curl -s http://localhost:3000 > /dev/null 2>&1; then
     echo "  ✓ Frontend ready!"
     break
   fi
@@ -84,11 +86,11 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  ✓  PolySolve is running!"
 echo ""
-echo "  Dashboard:       http://localhost:3006/dashboard"
-echo "  Portfolio:       http://localhost:3006/portfolio"
-echo "  Top 10:          http://localhost:3006/recommendations"
-echo "  Anomalies:       http://localhost:3006/anomalies"
-echo "  Markets:         http://localhost:3006/events"
+echo "  App:             http://localhost:3000"
+echo "  Dashboard:       http://localhost:3000/dashboard"
+echo "  CopyTrading:     http://localhost:3000/copytrading"
+echo "  Portfolio:       http://localhost:3000/portfolio"
+echo "  Markets:         http://localhost:3000/events"
 echo ""
 echo "  Backend API:     http://localhost:3002/api"
 echo "  Backend Health:  http://localhost:3002/health"
@@ -103,7 +105,7 @@ echo ""
 
 # Open browser
 sleep 2
-open http://localhost:3006/dashboard 2>/dev/null || true
+open http://localhost:3000 2>/dev/null || true
 
 # ── Keep running until Ctrl+C ──────────────────────────────────────────────────
 trap "echo ''; echo 'Stopping PolySolve...'; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit 0" INT TERM

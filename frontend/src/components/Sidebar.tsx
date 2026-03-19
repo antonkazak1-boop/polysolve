@@ -2,7 +2,8 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
+import { useAuth } from '@/contexts/AuthContext';
 
 const NAV_ITEMS = [
   { href: '/dashboard',       icon: '📊', label: 'Dashboard' },
@@ -23,6 +24,8 @@ const STORAGE_KEY = 'sidebar_collapsed';
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+  const { user, logout } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
   const [mounted, setMounted] = useState(false);
 
@@ -119,12 +122,40 @@ export default function Sidebar() {
         })}
       </nav>
 
-      {/* Footer */}
-      {!collapsed && (
-        <div className="px-3 py-3 border-t border-gray-800 text-[10px] text-gray-700">
-          Polymarket Analyzer
-        </div>
-      )}
+      {/* User / Footer */}
+      <div className="border-t border-gray-800 px-2 py-2 space-y-1">
+        {user ? (
+          <>
+            <Link
+              href="/settings"
+              title={collapsed ? 'Settings' : undefined}
+              className={`flex items-center gap-2.5 rounded-lg px-2 py-2 text-sm font-medium transition-colors w-full
+                ${pathname === '/settings' ? 'bg-blue-500/15 text-blue-300 border border-blue-500/20' : 'text-gray-400 hover:text-white hover:bg-gray-800'}
+                ${collapsed ? 'justify-center' : ''}`}
+            >
+              <span className="text-base flex-shrink-0">⚙️</span>
+              {!collapsed && <span className="truncate">{user.name || user.email.split('@')[0]}</span>}
+            </Link>
+            {!collapsed && (
+              <button
+                onClick={() => { logout(); router.push('/login'); }}
+                className="flex items-center gap-2.5 rounded-lg px-2 py-2 text-sm text-gray-500 hover:text-red-400 hover:bg-gray-800 transition-colors w-full"
+              >
+                <span className="text-base flex-shrink-0">🚪</span>
+                <span className="truncate">Выйти</span>
+              </button>
+            )}
+          </>
+        ) : (
+          <Link
+            href="/login"
+            className={`flex items-center gap-2.5 rounded-lg px-2 py-2 text-sm font-medium text-blue-400 hover:text-blue-300 hover:bg-gray-800 transition-colors w-full ${collapsed ? 'justify-center' : ''}`}
+          >
+            <span className="text-base flex-shrink-0">🔑</span>
+            {!collapsed && <span className="truncate">Войти</span>}
+          </Link>
+        )}
+      </div>
     </aside>
   );
 }

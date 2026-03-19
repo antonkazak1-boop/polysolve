@@ -5,34 +5,41 @@ import { gammaClient } from '../../clients/gamma-client';
 import { poll, syncTraderExits, getClobPrice } from '../../services/copy-trade';
 import { getClobStatus, cancelAllOrders, getTradingUserAddress, getTradingAddresses } from '../../clients/polymarket-clob';
 import { getCurrentCountry, getBlockedCountries } from '../../utils/region-guard';
+import { authMiddleware } from '../../middleware/auth';
 
 export const copytradingRouter = Router();
 
-// GET /api/copytrading/settings — global copy-trading settings
-copytradingRouter.get('/settings', async (_req: Request, res: Response) => {
+// All copytrading routes require authentication
+copytradingRouter.use(authMiddleware);
+
+// GET /api/copytrading/settings — per-user copy-trading settings (falls back to global)
+copytradingRouter.get('/settings', async (req: Request, res: Response) => {
   try {
-    const s = await (prisma as any).copyTradingSettings.upsert({
-      where: { id: 'global' },
-      update: {},
-      create: { id: 'global', minCopyPrice: 0.004, maxCopyPrice: 0.95 },
-    });
+    const userId = req.userId!;
+    let s = await (prisma as any).userCopySettings.findUnique({ where: { userId } });
+    if (!s) {
+      s = await (prisma as any).userCopySettings.create({
+        data: { userId, minCopyPrice: 0.004, maxCopyPrice: 0.95 },
+      });
+    }
     res.json(s);
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to load settings' });
   }
 });
 
-// PATCH /api/copytrading/settings — update global settings
+// PATCH /api/copytrading/settings — update per-user settings
 copytradingRouter.patch('/settings', async (req: Request, res: Response) => {
   try {
+    const userId = req.userId!;
     const { minCopyPrice, maxCopyPrice } = req.body;
     const data: Record<string, any> = {};
     if (minCopyPrice !== undefined) data.minCopyPrice = Math.min(Math.max(parseFloat(minCopyPrice), 0.001), 0.1);
     if (maxCopyPrice !== undefined) data.maxCopyPrice = Math.min(Math.max(parseFloat(maxCopyPrice), 0.5), 0.999);
-    const s = await (prisma as any).copyTradingSettings.upsert({
-      where: { id: 'global' },
+    const s = await (prisma as any).userCopySettings.upsert({
+      where: { userId },
       update: data,
-      create: { id: 'global', minCopyPrice: 0.004, maxCopyPrice: 0.95, ...data },
+      create: { userId, minCopyPrice: 0.004, maxCopyPrice: 0.95, ...data },
     });
     res.json(s);
   } catch (err: any) {
@@ -40,10 +47,11 @@ copytradingRouter.patch('/settings', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/copytrading/wallets — list all copy wallets
-copytradingRouter.get('/wallets', async (_req: Request, res: Response) => {
+// GET /api/copytrading/wallets — list user's copy wallets
+copytradingRouter.get('/wallets', async (req: Request, res: Response) => {
   try {
     const list = await (prisma as any).copyWallet.findMany({
+      where: { userId: req.userId },
       orderBy: { createdAt: 'desc' },
     });
     res.json(list);
@@ -71,8 +79,8 @@ copytradingRouter.post('/wallets', async (req: Request, res: Response) => {
     const addr = (walletAddress || '').trim();
     if (!addr) return res.status(400).json({ error: 'walletAddress required' });
 
-    const existing = await (prisma as any).copyWallet.findUnique({
-      where: { walletAddress: addr.toLowerCase() },
+    const existing = await (prisma as any).copyWallet.findFirst({
+      where: { userId: req.userId, walletAddress: addr.toLowerCase() },
     });
     if (existing) return res.status(400).json({ error: 'Wallet already added' });
 
@@ -81,6 +89,7 @@ copytradingRouter.post('/wallets', async (req: Request, res: Response) => {
     const cScale = Math.min(10, Math.max(0.01, parseFloat(req.body.copyScale) || 1));
     const created = await (prisma as any).copyWallet.create({
       data: {
+        userId: req.userId,
         walletAddress: addr.toLowerCase(),
         label: label || null,
         amountPerTrade: parseFloat(amountPerTrade) || 1,
@@ -140,6 +149,11 @@ copytradingRouter.patch('/wallets/:id', async (req: Request, res: Response) => {
     if (staleExitLossPct !== undefined) data.staleExitLossPct = Math.min(Math.max(parseFloat(staleExitLossPct), 10), 99);
     if (preCloseExitHours !== undefined) data.preCloseExitHours = Math.max(parseInt(preCloseExitHours), 0);
 
+    const wallet = await (prisma as any).copyWallet.findFirst({
+      where: { id: req.params.id, userId: req.userId },
+    });
+    if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
+
     const updated = await (prisma as any).copyWallet.update({
       where: { id: req.params.id },
       data,
@@ -153,6 +167,10 @@ copytradingRouter.patch('/wallets/:id', async (req: Request, res: Response) => {
 // DELETE /api/copytrading/wallets/:id
 copytradingRouter.delete('/wallets/:id', async (req: Request, res: Response) => {
   try {
+    const wallet = await (prisma as any).copyWallet.findFirst({
+      where: { id: req.params.id, userId: req.userId },
+    });
+    if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
     await (prisma as any).copyWallet.delete({ where: { id: req.params.id } });
     res.json({ ok: true });
   } catch (err: any) {
@@ -169,7 +187,7 @@ copytradingRouter.get('/logs', async (req: Request, res: Response) => {
     const action = req.query.action as string | undefined;
     const status = req.query.status as string | undefined;
 
-    const where: Record<string, any> = {};
+    const where: Record<string, any> = { userId: req.userId };
     if (wallet) where.walletAddress = wallet;
     if (action) where.action = action.toUpperCase();
     if (status) where.status = status;
@@ -189,12 +207,18 @@ copytradingRouter.get('/logs', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/copytrading/stats?wallet=0x... — per wallet or global
+// GET /api/copytrading/stats?wallet=0x... — per wallet or user-global
 copytradingRouter.get('/stats', async (req: Request, res: Response) => {
   try {
     const wallet = (req.query.wallet as string)?.toLowerCase();
-    const where = wallet ? { walletAddress: wallet } : {};
-    const posWhere: Record<string, any> = { sourceWalletAddress: { not: null } };
+    const where: Record<string, any> = { userId: req.userId };
+    if (wallet) where.walletAddress = wallet;
+    const userWallets = await (prisma as any).copyWallet.findMany({
+      where: { userId: req.userId },
+      select: { walletAddress: true },
+    });
+    const userAddrs = userWallets.map((w: any) => w.walletAddress);
+    const posWhere: Record<string, any> = { sourceWalletAddress: { in: userAddrs } };
     if (wallet) posWhere.sourceWalletAddress = wallet;
 
     const [totalCopied, totalSkipped, todayCopied, copyLogs, openPositions] = await Promise.all([
@@ -244,9 +268,12 @@ copytradingRouter.get('/stats', async (req: Request, res: Response) => {
 });
 
 // GET /api/copytrading/stats/per-wallet — array of per-wallet mini-stats for wallet cards
-copytradingRouter.get('/stats/per-wallet', async (_req: Request, res: Response) => {
+copytradingRouter.get('/stats/per-wallet', async (req: Request, res: Response) => {
   try {
-    const wallets = await (prisma as any).copyWallet.findMany({ select: { walletAddress: true } });
+    const wallets = await (prisma as any).copyWallet.findMany({
+      where: { userId: req.userId },
+      select: { walletAddress: true },
+    });
     const result = await Promise.all(
       wallets.map(async (w: any) => {
         const addr = w.walletAddress.toLowerCase();
@@ -292,7 +319,7 @@ copytradingRouter.get('/positions', async (req: Request, res: Response) => {
     const limit = Math.min(parseInt(req.query.limit as string) || 30, 200);
     const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
 
-    const where: Record<string, any> = { sourceWalletAddress: { not: null } };
+    const where: Record<string, any> = { userId: req.userId, sourceWalletAddress: { not: null } };
     if (wallet) where.sourceWalletAddress = wallet;
     if (statusParam === 'OPEN') where.status = 'OPEN';
     else if (statusParam === 'CLOSED') where.status = { not: 'OPEN' };
@@ -352,7 +379,7 @@ copytradingRouter.get('/region-check', async (_req: Request, res: Response) => {
 copytradingRouter.get('/live-trades', async (req: Request, res: Response) => {
   try {
     const wallet = (req.query.wallet as string)?.toLowerCase();
-    const where: Record<string, any> = {};
+    const where: Record<string, any> = { userId: req.userId };
     if (wallet) where.sourceWalletAddress = wallet;
 
     const trades = await (prisma as any).liveTrade.findMany({
@@ -375,7 +402,7 @@ copytradingRouter.get('/live-positions', async (req: Request, res: Response) => 
     const limit = Math.min(parseInt(req.query.limit as string) || 30, 200);
     const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
 
-    const where: Record<string, any> = { side: 'BUY', isTakeProfit: false };
+    const where: Record<string, any> = { userId: req.userId, side: 'BUY', isTakeProfit: false };
     if (wallet) where.sourceWalletAddress = wallet;
     if (statusParam === 'open') where.status = 'FILLED';
     else if (statusParam === 'closed') where.status = { in: ['CLOSED', 'CANCELLED'] };
@@ -440,9 +467,12 @@ copytradingRouter.get('/live-positions', async (req: Request, res: Response) => 
 });
 
 // GET /api/copytrading/live-stats — overall + per-wallet stats from liveTrade (not demoTrade)
-copytradingRouter.get('/live-stats', async (_req: Request, res: Response) => {
+copytradingRouter.get('/live-stats', async (req: Request, res: Response) => {
   try {
-    const wallets = await (prisma as any).copyWallet.findMany({ select: { walletAddress: true } });
+    const wallets = await (prisma as any).copyWallet.findMany({
+      where: { userId: req.userId },
+      select: { walletAddress: true },
+    });
     const perWallet = await Promise.all(
       wallets.map(async (w: any) => {
         const addr = w.walletAddress.toLowerCase();
@@ -496,12 +526,13 @@ copytradingRouter.post('/trigger', async (_req: Request, res: Response) => {
   }
 });
 
-// POST /api/copytrading/cancel-all — cancel all pending CLOB orders + mark DB as CANCELLED
-copytradingRouter.post('/cancel-all', async (_req: Request, res: Response) => {
+// POST /api/copytrading/cancel-all — cancel all pending CLOB orders for this user
+copytradingRouter.post('/cancel-all', async (req: Request, res: Response) => {
   try {
+    // TODO: In Phase 2 this will use per-user CLOB client; for now uses global
     const clobResult = await cancelAllOrders();
     const dbResult = await (prisma as any).liveTrade.updateMany({
-      where: { status: 'LIVE' },
+      where: { userId: req.userId, status: 'LIVE' },
       data: { status: 'CANCELLED' },
     });
     res.json({ ok: true, clobCancelled: clobResult, dbCancelled: dbResult.count });
@@ -511,7 +542,7 @@ copytradingRouter.post('/cancel-all', async (_req: Request, res: Response) => {
 });
 
 // GET /api/copytrading/reconcile — compare real Polymarket positions vs DB (для проверки актуальности)
-copytradingRouter.get('/reconcile', async (_req: Request, res: Response) => {
+copytradingRouter.get('/reconcile', async (req: Request, res: Response) => {
   try {
     const { funder, signer } = getTradingAddresses();
     const tradingUser = getTradingUserAddress();
@@ -545,12 +576,12 @@ copytradingRouter.get('/reconcile', async (_req: Request, res: Response) => {
     const realMap = new Map(realPositions.map((r) => [r.asset, r.size]));
 
     const dbOpenBuys = await (prisma as any).liveTrade.findMany({
-      where: { side: 'BUY', status: 'FILLED', isTakeProfit: false },
+      where: { userId: req.userId, side: 'BUY', status: 'FILLED', isTakeProfit: false },
       select: { id: true, tokenId: true, conditionId: true, marketTitle: true, outcome: true, size: true, sourceWalletAddress: true },
     });
     const dbClosedBuysByToken = new Map<string, any>();
     const closedBuys = await (prisma as any).liveTrade.findMany({
-      where: { side: 'BUY', status: 'CLOSED' },
+      where: { userId: req.userId, side: 'BUY', status: 'CLOSED' },
       select: { id: true, tokenId: true, marketTitle: true, outcome: true, errorMessage: true },
     });
     closedBuys.forEach((b: any) => {

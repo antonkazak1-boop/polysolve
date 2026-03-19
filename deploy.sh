@@ -8,7 +8,7 @@
 #   REPO_URL=...                     — если клонируем впервые
 #   GIT_BRANCH=main
 #   BACKEND_PORT=3002 FRONTEND_PORT=3006
-#   NEXT_PUBLIC_API_URL=http://IP:3002/api  — URL API для браузера (важно при доступе с другого ПК)
+#   NEXT_PUBLIC_API_URL=http://IP:3002      — URL API для браузера (важно при доступе с другого ПК)
 
 set -euo pipefail
 
@@ -17,7 +17,7 @@ REPO_URL="${REPO_URL:-https://github.com/antonkazak1-boop/polysolve.git}"
 GIT_BRANCH="${GIT_BRANCH:-main}"
 BACKEND_PORT="${BACKEND_PORT:-3002}"
 FRONTEND_PORT="${FRONTEND_PORT:-3006}"
-NEXT_PUBLIC_API_URL="${NEXT_PUBLIC_API_URL:-http://127.0.0.1:${BACKEND_PORT}/api}"
+NEXT_PUBLIC_API_URL="${NEXT_PUBLIC_API_URL:-http://127.0.0.1:${BACKEND_PORT}}"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {

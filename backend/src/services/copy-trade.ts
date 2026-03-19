@@ -23,9 +23,13 @@ const MAX_SELL_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const DEFAULT_MIN_COPY_PRICE = 0.004;
 const DEFAULT_MAX_COPY_PRICE = 0.95;
 
-/** Load global copy-trading price filters from DB (cached, refreshed each poll) */
-async function getGlobalPriceFilters(): Promise<{ minPrice: number; maxPrice: number }> {
+/** Load per-user or global copy-trading price filters from DB */
+async function getUserPriceFilters(userId: string | null): Promise<{ minPrice: number; maxPrice: number }> {
   try {
+    if (userId) {
+      const s = await (prisma as any).userCopySettings.findUnique({ where: { userId } });
+      if (s) return { minPrice: s.minCopyPrice ?? DEFAULT_MIN_COPY_PRICE, maxPrice: s.maxCopyPrice ?? DEFAULT_MAX_COPY_PRICE };
+    }
     const s = await (prisma as any).copyTradingSettings.upsert({
       where: { id: 'global' },
       update: {},
@@ -35,6 +39,11 @@ async function getGlobalPriceFilters(): Promise<{ minPrice: number; maxPrice: nu
   } catch {
     return { minPrice: DEFAULT_MIN_COPY_PRICE, maxPrice: DEFAULT_MAX_COPY_PRICE };
   }
+}
+
+/** @deprecated use getUserPriceFilters */
+async function getGlobalPriceFilters(): Promise<{ minPrice: number; maxPrice: number }> {
+  return getUserPriceFilters(null);
 }
 
 const CLOB_ABS_MIN_SHARES = 5;
@@ -262,6 +271,7 @@ async function ensureTakeProfitOrder(buyTrade: any): Promise<void> {
 
   const tpTrade = await (prisma as any).liveTrade.create({
     data: {
+      userId: buyTrade.userId || null,
       sourceWalletAddress: buyTrade.sourceWalletAddress,
       conditionId: buyTrade.conditionId,
       tokenId: buyTrade.tokenId,
@@ -309,6 +319,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
     for (const w of wallets) {
       const walletAddress = (w.walletAddress || '').trim().toLowerCase();
       if (!walletAddress) continue;
+      const ownerUserId: string | null = w.userId || null;
 
       const lastChecked: Date = w.lastCheckedAt ? new Date(w.lastCheckedAt) : new Date(0);
 
@@ -436,6 +447,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
 
               const liveTrade = await (prisma as any).liveTrade.create({
                 data: {
+                  userId: ownerUserId,
                   sourceWalletAddress: walletAddress,
                   conditionId: marketId,
                   tokenId,
@@ -454,6 +466,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
 
               await (prisma as any).copyTradeLog.create({
                 data: {
+                  userId: ownerUserId,
                   walletAddress,
                   action: 'BUY',
                   marketId,
@@ -489,6 +502,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
 
               const trade = await (prisma as any).demoTrade.create({
                 data: {
+                  userId: ownerUserId,
                   eventId: marketId,
                   eventTitle: marketTitle,
                   marketId,
@@ -509,6 +523,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
 
               await (prisma as any).copyTradeLog.create({
                 data: {
+                  userId: ownerUserId,
                   walletAddress,
                   action: 'BUY',
                   marketId,
@@ -630,6 +645,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
                       console.log(`[copy-trade] LIVE BUY cancelled (source sold before fill): ${marketTitle.slice(0, 45)} orderId=${liveOrder.orderId.slice(0, 16)}... cancelled=${cancelled}`);
                       await (prisma as any).copyTradeLog.create({
                         data: {
+                          userId: ownerUserId,
                           walletAddress,
                           action: 'SELL',
                           marketId,
@@ -712,6 +728,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
 
               await (prisma as any).liveTrade.create({
                 data: {
+                  userId: ownerUserId,
                   sourceWalletAddress: walletAddress,
                   conditionId: marketId,
                   tokenId,
@@ -749,6 +766,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
 
               await (prisma as any).copyTradeLog.create({
                 data: {
+                  userId: ownerUserId,
                   walletAddress,
                   action: 'SELL',
                   marketId,
@@ -843,6 +861,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
 
               await (prisma as any).copyTradeLog.create({
                 data: {
+                  userId: ownerUserId,
                   walletAddress,
                   action: 'SELL',
                   marketId,
@@ -976,7 +995,7 @@ async function retryFailedLiveTrades(): Promise<void> {
         if (freeShares !== null) retrySize = freeShares;
       }
 
-      const copyW = await (prisma as any).copyWallet.findUnique({
+      const copyW = await (prisma as any).copyWallet.findFirst({
         where: { walletAddress: (trade.sourceWalletAddress || '').toLowerCase() },
       });
       const minS = walletMinShares(copyW || {});
@@ -1202,6 +1221,7 @@ export async function syncTraderExits(): Promise<number> {
       } else if (orderResult.success) {
         await (prisma as any).liveTrade.create({
           data: {
+            userId: trade.userId || null,
             sourceWalletAddress: trade.sourceWalletAddress,
             conditionId: trade.conditionId,
             tokenId: trade.tokenId,

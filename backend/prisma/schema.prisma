@@ -162,16 +162,60 @@ model Alert {
   @@map("alerts")
 }
 
+model User {
+  id                   String    @id @default(uuid())
+  email                String    @unique
+  passwordHash         String
+  name                 String?
+  role                 String    @default("user") // "admin" | "user"
+  subscriptionEnd      DateTime?
+  isActive             Boolean   @default(true)
+  // Polymarket CLOB keys (AES-256-GCM encrypted)
+  polyPrivateKeyEnc    String?
+  polyApiKeyEnc        String?
+  polyApiSecretEnc     String?
+  polyApiPassphraseEnc String?
+  polyFunderAddress    String?
+  polySignatureType    Int       @default(0)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  copyWallets   CopyWallet[]
+  liveTrades    LiveTrade[]
+  copyTradeLogs CopyTradeLog[]
+  copySettings  UserCopySettings?
+  demoBalance   DemoBalance?
+
+  @@index([email])
+  @@map("users")
+}
+
+model UserCopySettings {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  minCopyPrice Float    @default(0.004)
+  maxCopyPrice Float    @default(0.95)
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_copy_settings")
+}
+
 model DemoBalance {
   id        String   @id @default("demo")
+  userId    String?  @unique
   balance   Float    @default(10000)
   updatedAt DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@map("demo_balance")
 }
 
 model DemoTrade {
   id                  String   @id @default(uuid())
+  userId              String?
   eventId             String
   eventTitle          String
   marketId            String
@@ -190,6 +234,7 @@ model DemoTrade {
   closedAt            DateTime?
   updatedAt           DateTime @updatedAt
 
+  @@index([userId])
   @@index([status])
   @@index([openedAt])
   @@index([sourceWalletAddress])
@@ -379,7 +424,8 @@ model CopyTradingSettings {
 // One row per wallet we copy — each is a separate "portfolio" (positions grouped by sourceWallet)
 model CopyWallet {
   id             String    @id @default(uuid())
-  walletAddress  String    @unique
+  userId         String?
+  walletAddress  String
   label          String?   // e.g. "planktonXD"
   amountPerTrade Float     @default(1.0)
   /// Minimum shares per order (Polymarket floor is 5; raise to scale up position size)
@@ -402,12 +448,17 @@ model CopyWallet {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, walletAddress])
+  @@index([userId])
   @@map("copy_wallets")
 }
 
 // Tracks real orders placed through CLOB API
 model LiveTrade {
   id                  String    @id @default(uuid())
+  userId              String?
   sourceWalletAddress String
   conditionId         String
   tokenId             String
@@ -427,6 +478,9 @@ model LiveTrade {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
   @@index([sourceWalletAddress])
   @@index([status])
   @@index([parentTradeId])
@@ -436,6 +490,7 @@ model LiveTrade {
 
 model CopyTradeLog {
   id            String   @id @default(uuid())
+  userId        String?
   walletAddress String
   action        String   // BUY | SELL
   marketId      String
@@ -449,6 +504,9 @@ model CopyTradeLog {
   skipReason    String?
   copiedAt      DateTime @default(now())
 
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
   @@index([walletAddress])
   @@index([copiedAt])
   @@index([status])

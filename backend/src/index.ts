@@ -16,11 +16,14 @@ import { signalsRouter } from './api/routes/signals';
 import { whalesRouter } from './api/routes/whales';
 import { cryptoRouter } from './api/routes/crypto';
 import { copytradingRouter } from './api/routes/copytrading';
+import { authRouter } from './api/routes/auth';
+import { adminRouter } from './api/routes/admin';
 import { setupWebSocket } from './api/websocket';
 import { startCron } from './services/cron-scheduler';
 import { startActivityFeedPoller } from './services/activity-feed';
 import { startCopyTradePoller } from './services/copy-trade';
 import { initClobClient, getClobStatus } from './clients/polymarket-clob';
+import { ensureAdminExists } from './services/auth';
 
 dotenv.config();
 
@@ -53,6 +56,8 @@ app.use('/api/signals', signalsRouter);
 app.use('/api/whales', whalesRouter);
 app.use('/api/crypto', cryptoRouter);
 app.use('/api/copytrading', copytradingRouter);
+app.use('/api/auth', authRouter);
+app.use('/api/admin', adminRouter);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -80,4 +85,6 @@ httpServer.listen(PORT, async () => {
   } else {
     console.log('[clob] POLY_PRIVATE_KEY not set — live trading disabled');
   }
+
+  await ensureAdminExists();
 });

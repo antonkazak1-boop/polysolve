@@ -61,7 +61,7 @@ npm run dev
 git clone https://github.com/antonkazak1-boop/polysolve.git && cd polysolve
 cp backend/.env.example backend/.env && nano backend/.env
 # С другого компа к UI — задай API для билда фронта:
-export NEXT_PUBLIC_API_URL=http://ТВОЙ_IP_СЕРВЕРА:3002/api
+export NEXT_PUBLIC_API_URL=http://ТВОЙ_IP_СЕРВЕРА:3002
 ./deploy.sh
 ```
 
