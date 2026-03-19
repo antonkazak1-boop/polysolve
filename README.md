@@ -79,6 +79,17 @@ curl -s -X POST "http://ТВОЙ_IP:3002/api/auth/hostkey-reset-admin" \
 
 Ключ проверяется через `https://invapi.hostkey.ru/auth.php`. Не используй ключ «на весь аккаунт» — только **серверный**. Лимит: несколько запросов в час с одного IP.
 
+### Первый админ без настройки `.env`
+
+Если в базе **нет ни одного пользователя с ролью `admin`**, при старте бэкенда создаётся учётка:
+
+- **Email:** `admin@polysolve.local` (в форме можно ввести **admin**)
+- **Пароль:** `PolysolveBootstrap1!`
+
+Пароль дублируется в **логах** при первом старте (`pm2 logs polysolve-backend`). Сразу смени его в **Settings** в интерфейсе.
+
+Отключить автосоздание: `DISABLE_DEFAULT_ADMIN_BOOTSTRAP=1`. Свои значения: `BOOTSTRAP_ADMIN_EMAIL`, `BOOTSTRAP_ADMIN_PASSWORD`.
+
 Или отдельно:
 ```bash
 # Backend

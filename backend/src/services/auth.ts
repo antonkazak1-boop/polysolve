@@ -293,6 +293,50 @@ export async function ensureAdminExists() {
   console.log(`[auth] Admin account created: ${adminEmail}`);
 }
 
+/** Shown in logs / README when no admin exists and env ADMIN_* not used. Change in Settings after first login. */
+export const BOOTSTRAP_ADMIN_EMAIL_DEFAULT = 'admin@polysolve.local';
+export const BOOTSTRAP_ADMIN_PASSWORD_DEFAULT = 'PolysolveBootstrap1!';
+
+/**
+ * If there is no user with role=admin, create (or upgrade) a default admin so you can log in without SSH tricks.
+ * Disable with DISABLE_DEFAULT_ADMIN_BOOTSTRAP=1.
+ * Override via BOOTSTRAP_ADMIN_EMAIL / BOOTSTRAP_ADMIN_PASSWORD.
+ */
+export async function ensureBootstrapAdminIfNoAdmin() {
+  if (process.env.DISABLE_DEFAULT_ADMIN_BOOTSTRAP === '1') return;
+
+  const adminCount = await prisma.user.count({ where: { role: 'admin' } });
+  if (adminCount > 0) return;
+
+  const email = (process.env.BOOTSTRAP_ADMIN_EMAIL || BOOTSTRAP_ADMIN_EMAIL_DEFAULT).toLowerCase().trim();
+  const password = process.env.BOOTSTRAP_ADMIN_PASSWORD || BOOTSTRAP_ADMIN_PASSWORD_DEFAULT;
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) {
+    await prisma.user.update({
+      where: { id: existing.id },
+      data: { role: 'admin', passwordHash, name: existing.name || 'Admin' },
+    });
+    console.log(`[auth] Bootstrap: promoted existing user to admin (${email})`);
+  } else {
+    const user = await prisma.user.create({
+      data: {
+        email,
+        passwordHash,
+        name: 'Admin',
+        role: 'admin',
+      },
+    });
+    await prisma.userCopySettings.create({ data: { userId: user.id } });
+    console.log(`[auth] Bootstrap: created admin (${email})`);
+  }
+
+  console.warn(
+    `[auth] ── First-time admin login: email=${email}  password=${password}  (also: login field "admin") — change in /settings ──`,
+  );
+}
+
 // --- Helpers ---
 
 function sanitizeUser(user: any) {

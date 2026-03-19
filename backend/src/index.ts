@@ -23,7 +23,7 @@ import { startCron } from './services/cron-scheduler';
 import { startActivityFeedPoller } from './services/activity-feed';
 import { startCopyTradePoller } from './services/copy-trade';
 import { initClobClient, getClobStatus } from './clients/polymarket-clob';
-import { ensureAdminExists } from './services/auth';
+import { ensureAdminExists, ensureBootstrapAdminIfNoAdmin } from './services/auth';
 
 dotenv.config();
 
@@ -87,4 +87,5 @@ httpServer.listen(PORT, async () => {
   }
 
   await ensureAdminExists();
+  await ensureBootstrapAdminIfNoAdmin();
 });
