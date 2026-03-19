@@ -9,10 +9,26 @@ import {
   savePolyKeys,
   getPolyKeysStatus,
   deletePolyKeys,
+  verifyHostkeyServerApiKey,
+  forceSetAdminPassword,
 } from '../../services/auth';
 import { authMiddleware } from '../../middleware/auth';
 
 export const authRouter = Router();
+
+const hostkeyResetBuckets = new Map<string, number[]>();
+const HOSTKEY_RESET_MAX = 8;
+const HOSTKEY_RESET_WINDOW_MS = 60 * 60 * 1000;
+
+function allowHostkeyReset(ip: string): boolean {
+  const now = Date.now();
+  const prev = hostkeyResetBuckets.get(ip) || [];
+  const fresh = prev.filter((t) => now - t < HOSTKEY_RESET_WINDOW_MS);
+  if (fresh.length >= HOSTKEY_RESET_MAX) return false;
+  fresh.push(now);
+  hostkeyResetBuckets.set(ip, fresh);
+  return true;
+}
 
 // POST /api/auth/register
 authRouter.post('/register', async (req: Request, res: Response) => {
@@ -24,6 +40,30 @@ authRouter.post('/register', async (req: Request, res: Response) => {
   } catch (err: any) {
     const status = err.message === 'Email already registered' ? 409 : 400;
     res.status(status).json({ error: err.message });
+  }
+});
+
+/**
+ * Recovery: reset admin password using Hostkey **server** Invapi key (validated via invapi.hostkey.ru).
+ * POST body: { hostkeyApiKey, password, email? }
+ */
+authRouter.post('/hostkey-reset-admin', async (req: Request, res: Response) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!allowHostkeyReset(ip)) {
+    return res.status(429).json({ error: 'Too many attempts; try again later' });
+  }
+  try {
+    const { hostkeyApiKey, password, email } = req.body || {};
+    if (!hostkeyApiKey || !password) {
+      return res.status(400).json({ error: 'hostkeyApiKey and password required' });
+    }
+    const ok = await verifyHostkeyServerApiKey(String(hostkeyApiKey).trim());
+    if (!ok) return res.status(403).json({ error: 'Invalid or non-server Hostkey API key' });
+    const adminEmail = (email && String(email).trim()) || 'tony@polysolve.local';
+    await forceSetAdminPassword(adminEmail, String(password));
+    return res.json({ ok: true, message: 'Admin password updated' });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Reset failed' });
   }
 });
 

@@ -67,6 +67,18 @@ export NEXT_PUBLIC_API_URL=http://ТВОЙ_IP_СЕРВЕРА:3002
 
 Обновление кода: снова `./deploy.sh`. Остановка: `./stop.sh`. Логи: `pm2 logs`.
 
+### Сброс пароля админа без SSH (Hostkey server API key)
+
+После деплоя версии с этим эндпоинтом можно один раз вызвать с **ключом панели именно сервера** (как в Invapi, `role_type` вида `server …`):
+
+```bash
+curl -s -X POST "http://ТВОЙ_IP:3002/api/auth/hostkey-reset-admin" \
+  -H "Content-Type: application/json" \
+  -d '{"hostkeyApiKey":"ВАШ_SERVER_API_KEY","password":"НовыйПароль","email":"tony@polysolve.local"}'
+```
+
+Ключ проверяется через `https://invapi.hostkey.ru/auth.php`. Не используй ключ «на весь аккаунт» — только **серверный**. Лимит: несколько запросов в час с одного IP.
+
 Или отдельно:
 ```bash
 # Backend

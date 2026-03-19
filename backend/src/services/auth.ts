@@ -1,5 +1,6 @@
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import axios from 'axios';
 import prisma from '../config/database';
 import { encrypt, decrypt } from '../utils/crypto';
 
@@ -123,6 +124,49 @@ export async function changePassword(userId: string, oldPassword: string, newPas
   await prisma.user.update({
     where: { id: userId },
     data: { passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) },
+  });
+}
+
+/**
+ * Verifies a Hostkey Invapi **server** API key (not account-wide billing key).
+ * See https://invapi.hostkey.ru/auth.php action=login
+ */
+export async function verifyHostkeyServerApiKey(hostkeyApiKey: string): Promise<boolean> {
+  const key = (hostkeyApiKey || '').trim();
+  if (!key || key.length < 10) return false;
+  try {
+    const body = new URLSearchParams();
+    body.set('action', 'login');
+    body.set('key', key);
+    body.set('fix_ix', '0');
+    const { data } = await axios.post('https://invapi.hostkey.ru/auth.php', body.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 20_000,
+      validateStatus: () => true,
+    });
+    if (data?.result === -1 || !data?.result?.token) return false;
+    const roleType = String(data.result.role_type || '');
+    // Server keys: "server 71894". Account keys: "Customer" — reject those.
+    if (!/^server\s+\d+/i.test(roleType)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Set password (and admin role) for an existing user by email — for recovery flows only. */
+export async function forceSetAdminPassword(email: string, newPassword: string) {
+  if (newPassword.length < 6) throw new Error('Password must be at least 6 characters');
+  const e = email.toLowerCase().trim();
+  const user = await prisma.user.findUnique({ where: { email: e } });
+  if (!user) throw new Error('User not found for this email');
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS),
+      role: 'admin',
+      name: user.name || 'Admin',
+    },
   });
 }
 
