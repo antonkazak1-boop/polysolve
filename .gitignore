@@ -42,3 +42,6 @@ Thumbs.db
 
 # Prisma
 backend/prisma/migrations/
+
+# TypeScript incremental
+*.tsbuildinfo

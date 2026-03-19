@@ -206,7 +206,7 @@ export default function AsymmetricPage() {
               If correct, you earn <strong className="text-yellow-300">4x–24x</strong> your stake.
             </p>
             <p className="text-gray-400 text-xs">
-              Key rule: win rate doesn't matter. A 20% win rate with 10x average payout is extremely profitable.
+              Key rule: win rate doesn&apos;t matter. A 20% win rate with 10x average payout is extremely profitable.
               We filter out &ldquo;dead&rdquo; outcomes (0–3¢) that the market has essentially declared impossible.
               4¢+ means there is still meaningful disagreement.
             </p>
@@ -381,7 +381,9 @@ function OpportunitiesGrid({ items }: { items: Opportunity[] }) {
             {/* Price box + stats */}
             <div className="flex items-stretch gap-3">
               <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg px-3 py-2 text-center min-w-[70px]">
-                <div className="text-[10px] text-gray-400 mb-0.5">"{market.targetOutcome}"</div>
+                <div className="text-[10px] text-gray-400 mb-0.5">
+                  &ldquo;{market.targetOutcome}&rdquo;
+                </div>
                 <div className="text-2xl font-bold text-yellow-400 font-mono leading-none">
                   {(price * 100).toFixed(0)}¢
                 </div>

@@ -4,7 +4,7 @@ import prisma from '../../config/database';
 import { gammaClient } from '../../clients/gamma-client';
 import { poll, syncTraderExits, getClobPrice } from '../../services/copy-trade';
 import { getClobStatus, cancelAllOrders, getTradingUserAddress, getTradingAddresses } from '../../clients/polymarket-clob';
-import { getCurrentCountry, getBlockedCountries, isRegionAllowedForTrading } from '../../utils/region-guard';
+import { getCurrentCountry, getBlockedCountries } from '../../utils/region-guard';
 
 export const copytradingRouter = Router();
 

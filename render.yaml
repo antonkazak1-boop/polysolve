@@ -8,6 +8,8 @@ services:
     startCommand: npx prisma db push --skip-generate && npm run start
     healthCheckPath: /health
     envVars:
+      - key: NODE_VERSION
+        value: "20.11.1"
       - key: NODE_ENV
         value: production
       - key: PORT
@@ -34,6 +36,10 @@ services:
     buildCommand: npm ci && npm run build
     startCommand: npm run start
     envVars:
+      - key: NODE_VERSION
+        value: "20.11.1"
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=4096
       - key: NODE_ENV
         value: production
       - key: PORT

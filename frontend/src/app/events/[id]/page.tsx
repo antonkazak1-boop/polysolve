@@ -184,7 +184,7 @@ export default function EventDetailPage() {
         {!news && !newsLoading && (
           <div className="text-center py-6 text-gray-600 text-sm">
             <div className="text-3xl mb-2">📡</div>
-            <div>Click "Fetch News" to get latest news and sentiment analysis</div>
+            <div>Click &ldquo;Fetch News&rdquo; to get latest news and sentiment analysis</div>
           </div>
         )}
 
