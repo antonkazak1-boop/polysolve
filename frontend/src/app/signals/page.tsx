@@ -304,15 +304,16 @@ export default function SignalsPage() {
   const [tradeSuccess, setTradeSuccess] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  const fetchSignals = useCallback(async () => {
+  const fetchSignals = useCallback(async (skipNews = false) => {
     setError('');
     try {
-      const res = await api.get('/signals', { params: { horizon, limit: 50 } });
-      setSignals(res.data.signals || []);
-      setCounts(res.data.counts || { fast: 0, medium: 0, long: 0, total: 0 });
+      const res = await api.get('/signals', { params: { horizon, limit: 50, skipNews: skipNews ? 'true' : undefined } });
+      const list = Array.isArray(res.data?.signals) ? res.data.signals : [];
+      setSignals(list);
+      setCounts(res.data?.counts || { fast: 0, medium: 0, long: 0, total: list.length });
       setLastUpdated(new Date());
-    } catch {
-      setError('Failed to load signals. Make sure the backend is running.');
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Не удалось загрузить сигналы. Проверьте, что бэкенд запущен.');
     }
   }, [horizon]);
 
@@ -442,8 +443,24 @@ export default function SignalsPage() {
       ) : (
         <div className="text-center py-16 text-gray-500">
           <div className="text-4xl mb-3">&#x1F4E1;</div>
-          <div>No signals for this time horizon right now</div>
-          <div className="text-xs mt-2 text-gray-600">Try "All Signals" tab or refresh</div>
+          <div className="font-medium text-gray-400">Сейчас нет сигналов по выбранному горизонту</div>
+          <div className="text-xs mt-2 text-gray-600 max-w-md mx-auto">
+            Нажмите Refresh — бэкенд подтянет события и пересчитает. Или загрузите без проверки новостей (быстрее).
+          </div>
+          <div className="flex justify-center gap-2 mt-4">
+            <button
+              onClick={() => fetchSignals(true)}
+              className="px-4 py-2 rounded-lg text-sm bg-gray-700 text-gray-300 hover:bg-gray-600"
+            >
+              Без проверки новостей
+            </button>
+            <button
+              onClick={() => fetchSignals(false)}
+              className="px-4 py-2 rounded-lg text-sm bg-gray-800 text-gray-400 hover:bg-gray-700"
+            >
+              Обновить
+            </button>
+          </div>
         </div>
       )}
 

@@ -334,7 +334,7 @@ export default function WalletsPage() {
   const [convSort, setConvSort] = useState<'strongest' | 'volume' | 'roi' | 'time'>('strongest');
   const [hideResolved, setHideResolved] = useState(true);
   const [watchedConv, setWatchedConv] = useState<WatchedConvergenceItem[]>([]);
-  const [convStats, setConvStats] = useState<{ total: number; resolved: number; winRate: number; byConsensus: Record<string, { total: number; wins: number; winRate: number }> } | null>(null);
+  const [convStats, setConvStats] = useState<{ total: number; resolved: number; wins: number; winRate: number; byConsensus: Record<string, { total: number; wins: number; winRate: number }> } | null>(null);
 
   const loadWatched = async () => {
     try {

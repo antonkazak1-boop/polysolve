@@ -109,20 +109,21 @@ class GammaClient {
   private clobHttp: AxiosInstance;
 
   constructor() {
+    const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
     this.http = axios.create({
       baseURL: GAMMA_BASE,
       timeout: 15000,
-      headers: { 'Accept': 'application/json' },
+      headers: { 'Accept': 'application/json', 'User-Agent': UA },
     });
     this.dataHttp = axios.create({
       baseURL: DATA_BASE,
       timeout: 15000,
-      headers: { 'Accept': 'application/json' },
+      headers: { 'Accept': 'application/json', 'User-Agent': UA },
     });
     this.clobHttp = axios.create({
       baseURL: CLOB_BASE,
       timeout: 10000,
-      headers: { 'Accept': 'application/json' },
+      headers: { 'Accept': 'application/json', 'User-Agent': UA },
     });
   }
 

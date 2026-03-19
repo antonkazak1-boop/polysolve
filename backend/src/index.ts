@@ -15,9 +15,12 @@ import { recommendationsRouter } from './api/routes/recommendations';
 import { signalsRouter } from './api/routes/signals';
 import { whalesRouter } from './api/routes/whales';
 import { cryptoRouter } from './api/routes/crypto';
+import { copytradingRouter } from './api/routes/copytrading';
 import { setupWebSocket } from './api/websocket';
 import { startCron } from './services/cron-scheduler';
 import { startActivityFeedPoller } from './services/activity-feed';
+import { startCopyTradePoller } from './services/copy-trade';
+import { initClobClient, getClobStatus } from './clients/polymarket-clob';
 
 dotenv.config();
 
@@ -49,19 +52,32 @@ app.use('/api/recommendations', recommendationsRouter);
 app.use('/api/signals', signalsRouter);
 app.use('/api/whales', whalesRouter);
 app.use('/api/crypto', cryptoRouter);
+app.use('/api/copytrading', copytradingRouter);
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// CLOB status
+app.get('/api/clob/status', (_req, res) => {
+  res.json(getClobStatus());
+});
+
 // Setup WebSocket
 setupWebSocket(io);
 
 // Start server
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 WebSocket server ready`);
   startCron();
   startActivityFeedPoller();
+  startCopyTradePoller();
+
+  if (process.env.POLY_PRIVATE_KEY) {
+    await initClobClient();
+  } else {
+    console.log('[clob] POLY_PRIVATE_KEY not set — live trading disabled');
+  }
 });

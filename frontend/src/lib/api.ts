@@ -1,6 +1,8 @@
 import axios from 'axios';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002/api';
+const raw = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002/api';
+// Backend routes are under /api — ensure baseURL ends with /api so paths like /copytrading/wallets resolve
+const API_URL = raw.replace(/\/+$/, '').endsWith('/api') ? raw.replace(/\/+$/, '') : `${raw.replace(/\/+$/, '')}/api`;
 
 const api = axios.create({
   baseURL: API_URL,

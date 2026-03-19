@@ -19,10 +19,19 @@ echo ""
 echo "  Polymarket Analytics & Demo Trading Dashboard"
 echo ""
 
-# ── Kill existing processes on our ports ───────────────────────────────────────
-echo "→ Stopping any existing processes on ports 3002 and 3006..."
-lsof -ti:3002 | xargs kill -9 2>/dev/null && echo "  Killed port 3002" || true
-lsof -ti:3006 | xargs kill -9 2>/dev/null && echo "  Killed port 3006" || true
+# ── Kill ALL existing polysolve/dev processes (zombies from previous sessions) ─
+echo "→ Stopping any existing processes..."
+# Kill by port
+lsof -ti:3002 2>/dev/null | xargs kill -9 2>/dev/null && echo "  Killed port 3002" || true
+lsof -ti:3006 2>/dev/null | xargs kill -9 2>/dev/null && echo "  Killed port 3006" || true
+# Kill zombie tsx/npm dev processes from polysolve
+pkill -f "polysolve.*tsx" 2>/dev/null || true
+pkill -f "polysolve.*npm run dev" 2>/dev/null || true
+pkill -f "polysolve.*next" 2>/dev/null || true
+ZOMBIE_COUNT=$(ps aux | grep -E "tsx watch|npm run dev" | grep polysolve | grep -v grep | wc -l | tr -d ' ')
+if [ "$ZOMBIE_COUNT" -gt "0" ]; then
+  echo "  Killed $ZOMBIE_COUNT zombie process(es)"
+fi
 sleep 1
 
 # ── Backend ────────────────────────────────────────────────────────────────────

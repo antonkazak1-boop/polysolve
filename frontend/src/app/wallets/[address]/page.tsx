@@ -456,35 +456,42 @@ export default function WalletProfilePage() {
                 const directPath = pos.eventSlug || pos.eventId;
                 const resolvePath = pos.marketId ? `/events/resolve/${encodeURIComponent(pos.marketId)}` : null;
                 const href = directPath ? `/events/${directPath}` : resolvePath;
-                const Wrapper = href ? Link : 'div';
-                const wrapperProps = href ? { href } : {};
-                return (
-                  <Wrapper key={i} {...wrapperProps} className="block">
-                    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex items-center gap-4 hover:border-cyan-500/40 hover:bg-gray-800/50 transition-all cursor-pointer">
-                      <OutcomeBadge outcome={pos.outcome} />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium text-white truncate">{pos.title}</div>
-                        <div className="text-xs text-gray-500 mt-0.5 flex gap-2 items-center">
-                          <span>{pos.category}</span>
-                          {pos.endDate && <span>· ends {new Date(pos.endDate).toLocaleDateString()}</span>}
-                          {href && (
-                            <span className="text-cyan-400 font-medium">
-                              {directPath ? '→ в событие' : '→ найти событие'}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="text-right shrink-0">
-                        <div className="text-sm font-mono text-white">{fmt$(pos.value)}</div>
-                        <div className="text-xs text-gray-500">{(pos.price * 100).toFixed(1)}¢ · {pos.size.toFixed(0)} sh</div>
-                        {pos.cashPnl != null && (
-                          <div className={`text-xs font-mono mt-0.5 ${pos.cashPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                            {pos.cashPnl >= 0 ? '+' : ''}{fmt$(pos.cashPnl)} ({pos.percentPnl?.toFixed(1)}%)
-                          </div>
+                const card = (
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex items-center gap-4 hover:border-cyan-500/40 hover:bg-gray-800/50 transition-all cursor-pointer">
+                    <OutcomeBadge outcome={pos.outcome} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-white truncate">{pos.title}</div>
+                      <div className="text-xs text-gray-500 mt-0.5 flex gap-2 items-center">
+                        <span>{pos.category}</span>
+                        {pos.endDate && <span>· ends {new Date(pos.endDate).toLocaleDateString()}</span>}
+                        {href && (
+                          <span className="text-cyan-400 font-medium">
+                            {directPath ? '→ в событие' : '→ найти событие'}
+                          </span>
                         )}
                       </div>
                     </div>
-                  </Wrapper>
+                    <div className="text-right shrink-0">
+                      <div className="text-sm font-mono text-white">{fmt$(pos.value)}</div>
+                      <div className="text-xs text-gray-500">{(pos.price * 100).toFixed(1)}¢ · {pos.size.toFixed(0)} sh</div>
+                      {pos.cashPnl != null && (
+                        <div className={`text-xs font-mono mt-0.5 ${pos.cashPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {pos.cashPnl >= 0 ? '+' : ''}{fmt$(pos.cashPnl)} ({pos.percentPnl?.toFixed(1)}%)
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+                return (
+                  href ? (
+                    <Link key={i} href={href} className="block">
+                      {card}
+                    </Link>
+                  ) : (
+                    <div key={i} className="block">
+                      {card}
+                    </div>
+                  )
                 );
               })
           )}

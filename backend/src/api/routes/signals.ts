@@ -19,7 +19,13 @@ signalsRouter.get('/', async (req: Request, res: Response) => {
     const limit = Math.min(parseInt(req.query.limit as string) || 30, 100);
     const skipNews = req.query.skipNews === 'true';
 
-    const allSignals = await generateSignals(skipNews);
+    let allSignals = await generateSignals(skipNews);
+    // If no signals with Perplexity, fallback to skipNews so user still sees something
+    if (allSignals.length === 0 && !skipNews) {
+      try {
+        allSignals = await generateSignals(true);
+      } catch { /* keep [] */ }
+    }
     const filtered = getSignalsByHorizon(allSignals, horizon as Horizon | 'all', limit);
 
     const counts = {

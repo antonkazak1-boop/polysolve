@@ -171,26 +171,28 @@ model DemoBalance {
 }
 
 model DemoTrade {
-  id             String   @id @default(uuid())
-  eventId        String
-  eventTitle     String
-  marketId       String
-  marketQuestion String
-  outcome        String   // YES or NO
-  amount         Float
-  entryPrice     Float
-  exitPrice      Float?
-  currentPrice   Float?
-  pnl            Float?
-  roi            Float?
-  status         String   // OPEN, CLOSED_WIN, CLOSED_LOSS, CLOSED_MANUAL
-  tags           String   @default("[]") // JSON array of tag labels
-  openedAt       DateTime @default(now())
-  closedAt       DateTime?
-  updatedAt      DateTime @updatedAt
+  id                  String   @id @default(uuid())
+  eventId             String
+  eventTitle          String
+  marketId            String
+  marketQuestion      String
+  outcome             String   // YES or NO
+  amount              Float
+  entryPrice          Float
+  exitPrice           Float?
+  currentPrice        Float?
+  pnl                 Float?
+  roi                 Float?
+  status              String   // OPEN, CLOSED_WIN, CLOSED_LOSS, CLOSED_MANUAL
+  tags                String   @default("[]") // JSON array of tag labels
+  sourceWalletAddress String?  // copy-trade: which wallet this position follows
+  openedAt            DateTime @default(now())
+  closedAt            DateTime?
+  updatedAt           DateTime @updatedAt
 
   @@index([status])
   @@index([openedAt])
+  @@index([sourceWalletAddress])
   @@map("demo_trades")
 }
 
@@ -362,6 +364,96 @@ model SignalPriceSnapshot {
 
   @@index([signalRecordId, snapshotAt])
   @@map("signal_price_snapshots")
+}
+
+// Global settings for copy-trading (singleton row with id='global')
+model CopyTradingSettings {
+  id                String  @id @default("global")
+  minCopyPrice      Float   @default(0.004)  // skip BUYs cheaper than this (junk outcomes)
+  maxCopyPrice      Float   @default(0.95)   // skip BUYs more expensive than this (near-resolved)
+  updatedAt         DateTime @updatedAt
+
+  @@map("copy_trading_settings")
+}
+
+// One row per wallet we copy — each is a separate "portfolio" (positions grouped by sourceWallet)
+model CopyWallet {
+  id             String    @id @default(uuid())
+  walletAddress  String    @unique
+  label          String?   // e.g. "planktonXD"
+  amountPerTrade Float     @default(1.0)
+  /// Minimum shares per order (Polymarket floor is 5; raise to scale up position size)
+  minOrderShares Int       @default(5)
+  /// Proportional multiplier: ourUsd = traderUsd * copyScale; amountPerTrade is the ceiling
+  copyScale      Float     @default(1.0)
+  takeProfitEnabled Boolean @default(false)
+  takeProfitRoiPercent Float @default(150.0)
+  takeProfitClosePercent Float @default(40.0)
+  takeProfitFallbackPrice Float @default(0.80) // if ROI target >= $1, use this price instead
+  // Auto-exit stale positions: if held > N days and price dropped > X% from entry
+  staleExitEnabled      Boolean @default(true)
+  staleExitDays         Int     @default(7)    // exit after this many days if price is bad
+  staleExitLossPct      Float   @default(70.0) // exit if price fell more than this % from entry
+  // Exit before market closes: exit N hours before endDate if price < entry (avoid holding trash)
+  preCloseExitHours     Int     @default(3)    // exit this many hours before market endDate
+  enabled        Boolean   @default(true)
+  mode           String    @default("demo") // "demo" | "live"
+  lastCheckedAt  DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("copy_wallets")
+}
+
+// Tracks real orders placed through CLOB API
+model LiveTrade {
+  id                  String    @id @default(uuid())
+  sourceWalletAddress String
+  conditionId         String
+  tokenId             String
+  marketTitle         String
+  outcome             String
+  side                String    // BUY | SELL
+  price               Float
+  size                Int       // shares
+  usdcAmount          Float
+  orderId             String?   // from CLOB response
+  status              String    @default("PENDING") // PENDING | LIVE | FILLED | FAILED | CANCELLED | CLOSED
+  parentTradeId       String?
+  isTakeProfit        Boolean   @default(false)
+  marketEndDate       DateTime? // when the market closes (from Gamma API), used for pre-close exit
+  errorMessage        String?
+  copyTradeLogId      String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([sourceWalletAddress])
+  @@index([status])
+  @@index([parentTradeId])
+  @@index([createdAt])
+  @@map("live_trades")
+}
+
+model CopyTradeLog {
+  id            String   @id @default(uuid())
+  walletAddress String
+  action        String   // BUY | SELL
+  marketId      String
+  marketTitle   String
+  outcome       String
+  sourcePrice   Float
+  copyPrice     Float
+  amount        Float
+  demoTradeId   String?
+  status        String   @default("COPIED") // COPIED | SKIPPED | FAILED
+  skipReason    String?
+  copiedAt      DateTime @default(now())
+
+  @@index([walletAddress])
+  @@index([copiedAt])
+  @@index([status])
+  @@index([action])
+  @@map("copy_trade_logs")
 }
 
 model StrategySignal {

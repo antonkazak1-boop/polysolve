@@ -525,7 +525,8 @@ export function invalidateSignalsCache() {
 }
 
 export async function generateSignals(skipNews = false): Promise<Signal[]> {
-  if (cachedSignals && Date.now() - cacheTs < CACHE_TTL) return cachedSignals;
+  // Only return cache if it has actual signals (don't cache empty results)
+  if (cachedSignals && cachedSignals.length > 0 && Date.now() - cacheTs < CACHE_TTL) return cachedSignals;
 
   const [events1, events2, anomalies, cryptoPrices] = await Promise.all([
     gammaClient.getEvents({ limit: 100, active: true, closed: false, archived: false, order: 'volume24hr', ascending: false }),
@@ -581,6 +582,7 @@ export async function generateSignals(skipNews = false): Promise<Signal[]> {
   // PHASE 3: Perplexity analysis (unless skipNews)
   let perplexityResults = new Map<string, MarketAnalysis>();
 
+  let perplexityFailed = false;
   if (!skipNews && passedCandidates.length > 0) {
     const marketCandidates: MarketCandidate[] = passedCandidates.map(c => ({
       marketQuestion: c.question,
@@ -592,8 +594,14 @@ export async function generateSignals(skipNews = false): Promise<Signal[]> {
 
     try {
       perplexityResults = await analyzeMarketsBatch(marketCandidates, 3);
+      // If ALL results are empty/missing, treat as failure
+      if (perplexityResults.size === 0) {
+        console.warn('[signals] Perplexity returned 0 results — falling back to skipNews mode');
+        perplexityFailed = true;
+      }
     } catch (err: any) {
-      console.error('[signals] Perplexity batch failed:', err.message);
+      console.error('[signals] Perplexity batch failed:', err.message, '— falling back to skipNews mode');
+      perplexityFailed = true;
     }
   }
 
@@ -605,11 +613,10 @@ export async function generateSignals(skipNews = false): Promise<Signal[]> {
     const key = cacheKeyFn(c.question);
     const pplx = perplexityResults.get(key) ?? null;
 
-    // If Perplexity is enabled and says not active → skip
-    if (!skipNews && pplx && !pplx.active) continue;
-
-    // If Perplexity is enabled and relevance too low → skip (can't assess this market)
-    if (!skipNews && pplx && pplx.relevance < 25) continue;
+    // If Perplexity is enabled AND succeeded → apply its filters
+    const usePerplexity = !skipNews && !perplexityFailed;
+    if (usePerplexity && pplx && !pplx.active) continue;
+    if (usePerplexity && pplx && pplx.relevance < 25) continue;
 
     // Numerical side selection
     const numResult = selectSideNumerical(c.prices, c.outcomes, c.dayChange, c.weekChange, c.anomalies);
@@ -657,7 +664,7 @@ export async function generateSignals(skipNews = false): Promise<Signal[]> {
     }
 
     let confidence: number;
-    if (skipNews || !pplx) {
+    if (skipNews || perplexityFailed || !pplx) {
       confidence = Math.round(numbersScore) + getCategoryModifier(c.category);
       confidence = Math.max(1, Math.min(100, confidence));
     } else {
@@ -669,7 +676,7 @@ export async function generateSignals(skipNews = false): Promise<Signal[]> {
     if (adj) confidence = Math.max(1, Math.min(100, confidence + adj));
 
     // Minimum threshold: with Perplexity = 35, without = 20
-    const minConf = (skipNews || !pplx) ? 20 : 35;
+    const minConf = (skipNews || perplexityFailed || !pplx) ? 20 : 35;
     if (confidence < minConf) continue;
 
     signals.push({
@@ -724,10 +731,20 @@ export async function generateSignals(skipNews = false): Promise<Signal[]> {
     if (warnings.length > 0) s.correlationWarning = warnings.join('; ');
   }
 
-  // Market efficiency + Kelly stake
+  // Market efficiency + Kelly stake (defensive: no NaN, no throw)
   for (const s of signals) {
-    s.marketEfficiency = computeMarketEfficiency(s.liquidity, s.volume24h, s.oneDayChange);
-    s.suggestedStakePct = computeKellyStake(s.confidence / 100, s.entryPrice);
+    try {
+      const eff = computeMarketEfficiency(
+        Number(s.liquidity) || 0,
+        Number(s.volume24h) || 0,
+        Number(s.oneDayChange) ?? 0
+      );
+      s.marketEfficiency = Number.isFinite(eff) ? eff : undefined;
+    } catch { s.marketEfficiency = undefined; }
+    try {
+      const kelly = computeKellyStake(s.confidence / 100, s.entryPrice);
+      s.suggestedStakePct = Number.isFinite(kelly) ? kelly : 0;
+    } catch { s.suggestedStakePct = 0; }
   }
 
   console.log(`[signals] final: ${signals.length} signals (was ${passedCandidates.length} candidates)`);
@@ -754,9 +771,12 @@ export function getSignalsByHorizon(signals: Signal[], horizon: Horizon | 'all',
 // ─── Market efficiency score ──────────────────────────────────────────────────
 // Lower = less efficient = more opportunity. 0-100.
 function computeMarketEfficiency(liquidity: number, volume24h: number, dayChange: number): number {
-  const liqPart = Math.log10(Math.max(liquidity, 1) + 1) * 6;
-  const volPart = Math.log10(Math.max(volume24h, 1) + 1) * 5;
-  const volatilityPart = Math.min(20, Math.abs(dayChange) * 100) * 0.5;
+  const liq = Math.max(Number(liquidity) || 0, 1);
+  const vol = Math.max(Number(volume24h) || 0, 1);
+  const change = Number(dayChange);
+  const liqPart = Math.log10(liq + 1) * 6;
+  const volPart = Math.log10(vol + 1) * 5;
+  const volatilityPart = Math.min(20, Math.abs(Number.isFinite(change) ? change : 0) * 100) * 0.5;
   const raw = liqPart + volPart - volatilityPart;
   return Math.max(0, Math.min(100, Math.round(raw)));
 }

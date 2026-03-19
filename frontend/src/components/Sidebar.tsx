@@ -16,6 +16,7 @@ const NAV_ITEMS = [
   { href: '/whales',          icon: '🐋', label: 'Whales' },
   { href: '/wallets',         icon: '👛', label: 'Wallets' },
   { href: '/portfolio',       icon: '💼', label: 'Portfolio' },
+  { href: '/copytrading',     icon: '🤖', label: 'CopyTrade',  badge: 'new' },
 ];
 
 const STORAGE_KEY = 'sidebar_collapsed';
