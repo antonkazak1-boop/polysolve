@@ -3,6 +3,8 @@ services:
     name: polysolve-backend
     runtime: node
     plan: starter
+    # Default blueprint region is oregon; EU = frankfurt (cannot change after service is created)
+    region: frankfurt
     rootDir: backend
     buildCommand: npm ci && npx prisma generate && npm run build
     startCommand: npx prisma db push --skip-generate && npm run start
@@ -32,6 +34,7 @@ services:
     name: polysolve-frontend
     runtime: node
     plan: starter
+    region: frankfurt
     rootDir: frontend
     buildCommand: npm ci && npm run build
     startCommand: npm run start
