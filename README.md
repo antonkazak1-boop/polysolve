@@ -53,6 +53,20 @@ npm run prisma:migrate
 npm run dev
 ```
 
+## Деплой на VPS (PM2)
+
+На сервере: Node 20+, `git`, глобально `pm2` (`npm i -g pm2`).
+
+```bash
+git clone https://github.com/antonkazak1-boop/polysolve.git && cd polysolve
+cp backend/.env.example backend/.env && nano backend/.env
+# С другого компа к UI — задай API для билда фронта:
+export NEXT_PUBLIC_API_URL=http://ТВОЙ_IP_СЕРВЕРА:3002/api
+./deploy.sh
+```
+
+Обновление кода: снова `./deploy.sh`. Остановка: `./stop.sh`. Логи: `pm2 logs`.
+
 Или отдельно:
 ```bash
 # Backend
