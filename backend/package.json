@@ -9,7 +9,8 @@
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "admin:set-password": "node scripts/set-admin-password.cjs"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.0",

@@ -222,6 +222,17 @@ export async function ensureAdminExists() {
       await prisma.user.update({ where: { id: existing.id }, data: { role: 'admin' } });
       console.log(`[auth] Promoted ${adminEmail} to admin`);
     }
+    // One-shot password sync (set in .env, restart backend once, then remove flag)
+    if (process.env.ADMIN_FORCE_PASSWORD_RESET === '1') {
+      const passwordHash = await bcrypt.hash(adminPassword, BCRYPT_ROUNDS);
+      await prisma.user.update({
+        where: { id: existing.id },
+        data: { passwordHash, name: existing.name || 'Admin' },
+      });
+      console.log(
+        '[auth] Admin password updated from ADMIN_PASSWORD (remove ADMIN_FORCE_PASSWORD_RESET=1 from .env and restart)',
+      );
+    }
     return;
   }
 
