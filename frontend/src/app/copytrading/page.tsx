@@ -130,12 +130,15 @@ export default function CopyTradingPage() {
   const [loading, setLoading] = useState(true);
   const [triggering, setTriggering] = useState(false);
   const [triggerResult, setTriggerResult] = useState<string | null>(null);
+  const [resyncing, setResyncing] = useState(false);
   const [reconcileLoading, setReconcileLoading] = useState(false);
   const [reconcileData, setReconcileData] = useState<{
     tradingUser?: string;
+    reconcileNote?: string;
     desynced: { asset: string; realSize: number; marketTitle?: string; outcome?: string }[];
     ghostCandidates: { marketTitle: string; tokenId: string; dbSize: number }[];
     realPositionsCount: number;
+    meaningfulPositionsCount?: number;
     dbOpenBuysCount: number;
   } | null>(null);
   const [selectedWallet, setSelectedWallet] = useState<string | null>(null);
@@ -315,19 +318,55 @@ export default function CopyTradingPage() {
       setTriggerResult('Error: ' + (e.response?.data?.error || e.message));
     } finally { setTriggering(false); }
   }
+  async function resyncPositions() {
+    setResyncing(true);
+    setTriggerResult(null);
+    try {
+      const res = await api.post('/copytrading/resync-positions');
+      const msg = res.data?.message || 'Resync started';
+      setTriggerResult(`${msg} — positions will refresh automatically`);
+      // Auto-refresh positions after ~65s when background work should be done
+      setTimeout(async () => { await loadAll(); setResyncing(false); }, 65_000);
+    } catch (e: any) {
+      setTriggerResult('Resync error: ' + (e.response?.data?.error || e.message));
+      setResyncing(false);
+    }
+  }
+
   async function triggerReconcile() {
     setReconcileLoading(true); setReconcileData(null);
     try {
       const res = await api.get('/copytrading/reconcile');
       const d = res.data;
-      if (!d.ok) { setReconcileData({ desynced: [], ghostCandidates: [], realPositionsCount: 0, dbOpenBuysCount: 0 }); return; }
+      if (!d.ok) {
+        setReconcileData({
+          desynced: [],
+          ghostCandidates: [],
+          realPositionsCount: 0,
+          meaningfulPositionsCount: 0,
+          dbOpenBuysCount: 0,
+        });
+        return;
+      }
       setReconcileData({
-        tradingUser: d.tradingUser, desynced: d.desynced || [],
+        tradingUser: d.tradingUser,
+        reconcileNote: d.reconcileNote,
+        desynced: d.desynced || [],
         ghostCandidates: (d.ghostCandidates || []).map((g: any) => ({ marketTitle: g.marketTitle, tokenId: g.tokenId, dbSize: g.dbSize })),
-        realPositionsCount: d.realPositionsCount ?? 0, dbOpenBuysCount: d.dbOpenBuysCount ?? 0,
+        realPositionsCount: d.realPositionsCount ?? 0,
+        meaningfulPositionsCount: d.meaningfulPositionsCount,
+        dbOpenBuysCount: d.dbOpenBuysCount ?? 0,
       });
       await loadAll();
-    } catch { setReconcileData({ desynced: [], ghostCandidates: [], realPositionsCount: 0, dbOpenBuysCount: 0 }); }
+    } catch {
+      setReconcileData({
+        desynced: [],
+        ghostCandidates: [],
+        realPositionsCount: 0,
+        meaningfulPositionsCount: 0,
+        dbOpenBuysCount: 0,
+      });
+    }
     finally { setReconcileLoading(false); }
   }
 
@@ -370,10 +409,15 @@ export default function CopyTradingPage() {
           <h1 className="text-xl font-semibold text-white tracking-tight">Copy Trading</h1>
           <div className="flex items-center gap-1.5">
             {clobStatus && (
-              <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-medium
+              <span
+                title={clobStatus.ready ? 'Polymarket CLOB готов к ордерам' : (clobStatus.error || 'CLOB не инициализирован — см. логи бэкенда')}
+                className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-medium max-w-[min(100vw-8rem,22rem)] truncate
                 ${clobStatus.ready ? 'bg-emerald-500/10 text-emerald-400 ring-1 ring-emerald-500/20' : 'bg-amber-500/10 text-amber-400 ring-1 ring-amber-500/20'}`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${clobStatus.ready ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${clobStatus.ready ? 'bg-emerald-400' : 'bg-amber-400'}`} />
                 {clobStatus.ready ? 'Connected' : 'Offline'}
+                {!clobStatus.ready && clobStatus.error && (
+                  <span className="text-[10px] text-amber-500/80 truncate hidden sm:inline" title={clobStatus.error}> — {clobStatus.error}</span>
+                )}
               </span>
             )}
             {liveCount > 0 && (
@@ -392,6 +436,13 @@ export default function CopyTradingPage() {
           <button onClick={triggerPoll} disabled={triggering}
             className="h-8 px-3 text-xs font-medium rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-gray-300 ring-1 ring-white/[0.06] transition-all disabled:opacity-40">
             {triggering ? 'Scanning...' : 'Scan now'}
+          </button>
+          <button
+            onClick={resyncPositions}
+            disabled={resyncing}
+            title="Фон: syncTraderExits + sweep orphans + retry failed SELL (~60s). Нужен VPN если регион блокирует CLOB."
+            className="h-8 px-3 text-xs font-medium rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 ring-1 ring-amber-500/20 transition-all disabled:opacity-40">
+            {resyncing ? 'Syncing...' : 'Sync positions'}
           </button>
           <button onClick={triggerReconcile} disabled={reconcileLoading}
             className="h-8 px-3 text-xs font-medium rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-gray-300 ring-1 ring-white/[0.06] transition-all disabled:opacity-40">
@@ -850,10 +901,19 @@ function Pagination({ page, totalPages, onPageChange }: { page: number; totalPag
 }
 
 function ReconcilePanel({ data, onClose }: {
-  data: { tradingUser?: string; desynced: any[]; ghostCandidates: any[]; realPositionsCount: number; dbOpenBuysCount: number };
+  data: {
+    tradingUser?: string;
+    reconcileNote?: string;
+    desynced: any[];
+    ghostCandidates: any[];
+    realPositionsCount: number;
+    meaningfulPositionsCount?: number;
+    dbOpenBuysCount: number;
+  };
   onClose: () => void;
 }) {
   const ok = data.desynced.length === 0 && data.ghostCandidates.length === 0;
+  const meaningful = data.meaningfulPositionsCount ?? data.realPositionsCount;
   return (
     <div className={`rounded-xl ring-1 overflow-hidden ${ok ? 'ring-emerald-500/10 bg-emerald-500/[0.03]' : 'ring-amber-500/10 bg-amber-500/[0.03]'}`}>
       <div className="flex items-center justify-between px-4 py-3">
@@ -861,25 +921,39 @@ function ReconcilePanel({ data, onClose }: {
           <span className={`text-xs font-medium ${ok ? 'text-emerald-400' : 'text-amber-400'}`}>
             {ok ? 'All synced' : `${data.desynced.length + data.ghostCandidates.length} issues`}
           </span>
-          <span className="text-[11px] text-gray-500">DB: {data.dbOpenBuysCount} open / Exchange: {data.realPositionsCount} positions</span>
+          <span className="text-[11px] text-gray-500">
+            DB open FILLED: {data.dbOpenBuysCount} / on-chain positions: {data.realPositionsCount}
+            {meaningful !== data.realPositionsCount && ` (≥1 sh: ${meaningful})`}
+          </span>
         </div>
         <button onClick={onClose} className="text-gray-500 hover:text-white">
           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
+      {data.reconcileNote && (
+        <div className="px-4 pb-2 text-[10px] text-gray-500 leading-relaxed border-b border-white/[0.04]">
+          <span className="text-gray-600">Reconcile: </span>{data.reconcileNote}
+        </div>
+      )}
       {data.desynced.length > 0 && (
-        <div className="px-4 pb-3">
-          <div className="text-[11px] text-amber-400 mb-1 font-medium">Desynced ({data.desynced.length})</div>
-          <div className="space-y-0.5 max-h-24 overflow-y-auto text-[11px] text-gray-400">
-            {data.desynced.slice(0, 10).map((d, i) => <div key={i}>{d.marketTitle?.slice(0, 60)} — {d.realSize} shares</div>)}
+        <div className="px-4 pb-3 pt-2">
+          <div className="text-[11px] text-amber-400 mb-1 font-medium">
+            Desynced — цепь ещё держит шары, в БД BUY уже CLOSED ({data.desynced.length})
+          </div>
+          <div className="space-y-0.5 max-h-28 overflow-y-auto text-[11px] text-gray-400">
+            {data.desynced.slice(0, 15).map((d, i) => <div key={i}>{d.marketTitle?.slice(0, 60)} — {d.realSize?.toFixed?.(2) ?? d.realSize} sh</div>)}
+            {data.desynced.length > 15 && <div className="text-gray-600">+{data.desynced.length - 15} more…</div>}
           </div>
         </div>
       )}
       {data.ghostCandidates.length > 0 && (
         <div className="px-4 pb-3">
-          <div className="text-[11px] text-gray-400 mb-1 font-medium">Ghost candidates ({data.ghostCandidates.length})</div>
-          <div className="space-y-0.5 max-h-24 overflow-y-auto text-[11px] text-gray-500">
-            {data.ghostCandidates.slice(0, 10).map((g, i) => <div key={i}>{g.marketTitle?.slice(0, 60)}</div>)}
+          <div className="text-[11px] text-gray-400 mb-1 font-medium">
+            Ghost — в БД открытый FILLED, на цепи 0 шаров ({data.ghostCandidates.length})
+          </div>
+          <div className="space-y-0.5 max-h-28 overflow-y-auto text-[11px] text-gray-500">
+            {data.ghostCandidates.slice(0, 15).map((g, i) => <div key={i}>{g.marketTitle?.slice(0, 60)}</div>)}
+            {data.ghostCandidates.length > 15 && <div className="text-gray-600">+{data.ghostCandidates.length - 15} more…</div>}
           </div>
         </div>
       )}

@@ -60,6 +60,28 @@ export function getCoinBySymbol(prices: CoinPrice[], sym: string): CoinPrice | u
   return prices.find(p => p.symbol === s || p.id === s);
 }
 
+let _btcUsdSpot: { v: number; t: number } | null = null;
+const BTC_USD_TTL_MS = 8000;
+
+/** Spot BTC/USD (CoinGecko) — closer to broad USD index than USDT pair; Polymarket often uses Chainlink, not identical. */
+export async function getBitcoinUsdSpot(): Promise<number | null> {
+  if (_btcUsdSpot && Date.now() - _btcUsdSpot.t < BTC_USD_TTL_MS) return _btcUsdSpot.v;
+  try {
+    const res = await axios.get(`${CG_BASE}/simple/price`, {
+      params: { ids: 'bitcoin', vs_currencies: 'usd' },
+      timeout: 10_000,
+    });
+    const v = res.data?.bitcoin?.usd;
+    if (typeof v === 'number' && v > 0) {
+      _btcUsdSpot = { v, t: Date.now() };
+      return v;
+    }
+  } catch (e: any) {
+    console.warn('[CoinGecko] BTC/USD spot failed:', e.message);
+  }
+  return null;
+}
+
 /**
  * Parse a crypto price-target market question.
  * Examples:

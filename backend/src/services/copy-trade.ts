@@ -72,6 +72,17 @@ export async function getClobPrice(tokenId: string): Promise<number | null> {
   }
 }
 
+/** Ask price (sell side) — the price at which sellers are listing. */
+async function getClobAskPrice(tokenId: string): Promise<number | null> {
+  try {
+    const res = await clobHttp.get('/price', { params: { token_id: tokenId, side: 'sell' } });
+    const p = parseFloat(res.data?.price);
+    return isNaN(p) ? null : p;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Determine how much USDC to spend on the copy trade.
  * Uses the source trader's actual usdcSize, clamped to amountPerTrade max.
@@ -108,7 +119,52 @@ function makeTradeKey(walletAddress: string, raw: any): string {
   const size = raw.size ?? raw.shares ?? '0';
   const price = raw.price ?? raw.averagePrice ?? '0';
   const market = raw.conditionId || raw.marketId || '';
-  return `${walletAddress.toLowerCase()}-${market}-${ts}-${size}-${price}`;
+  const out = parseOutcome(raw);
+  // Include outcome so YES and NO legs are never deduped into one key (and vice versa).
+  return `${walletAddress.toLowerCase()}-${market}-${ts}-${size}-${price}-${out}`;
+}
+
+/**
+ * If we already copied an open position on the *other* outcome of the same binary market,
+ * skip copying this BUY — otherwise we mirror a hedge / both-sides punt (e.g. cricket)
+ * and pay ~2× with no edge.
+ */
+async function hasOpenOppositeOutcome(
+  ownerUserId: string | null,
+  sourceWallet: string,
+  conditionId: string,
+  incomingOutcome: string,
+  isLive: boolean
+): Promise<boolean> {
+  const inc = incomingOutcome.toUpperCase();
+  const userClause = ownerUserId ? { userId: ownerUserId } : { userId: null };
+
+  if (isLive) {
+    const row = await (prisma as any).liveTrade.findFirst({
+      where: {
+        ...userClause,
+        sourceWalletAddress: sourceWallet,
+        conditionId,
+        side: 'BUY',
+        isTakeProfit: false,
+        status: { in: ['LIVE', 'FILLED', 'PENDING'] },
+        size: { gt: 0 },
+        outcome: { not: inc },
+      },
+    });
+    return !!row;
+  }
+
+  const demo = await (prisma as any).demoTrade.findFirst({
+    where: {
+      ...userClause,
+      sourceWalletAddress: sourceWallet,
+      marketId: conditionId,
+      status: 'OPEN',
+      outcome: { not: inc },
+    },
+  });
+  return !!demo;
 }
 
 const TP_FALLBACK_PRICE = 0.80; // if ROI target exceeds $1, cap at this price
@@ -397,6 +453,14 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
           });
           if (alreadyCopied) { skipped++; continue; }
 
+          if (await hasOpenOppositeOutcome(ownerUserId, walletAddress, marketId, outcome, isLive)) {
+            console.log(
+              `[copy-trade] BUY skipped (open opposite leg on same market): ${marketTitle.slice(0, 55)} → ${outcome} (${walletAddress.slice(0, 8)})`
+            );
+            skipped++;
+            continue;
+          }
+
           try {
             const copyPrice = price;
             const maxAmount = Number(w.amountPerTrade) || 1;
@@ -557,15 +621,8 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
                 skipped++;
                 continue;
               }
-              const regionOk = await isRegionAllowedForTrading();
-              if (!regionOk) {
-                const country = await getCurrentCountry();
-                console.warn(`[copy-trade] LIVE SELL skipped — region blocked (IP: ${country || 'unknown'}). Use VPN.`);
-                skipped++;
-                continue;
-              }
 
-              // Find matching BUY: prefer FILLED; if only LIVE, check CLOB — limit may have filled
+              // --- Phase 1: cancel BUY limit orders & discover filled ones (works even without VPN) ---
               let liveBuy = await (prisma as any).liveTrade.findFirst({
                 where: {
                   sourceWalletAddress: walletAddress,
@@ -578,8 +635,6 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
                 orderBy: { createdAt: 'desc' },
               });
 
-              // Cancel ALL pending LIVE BUY limit orders for this market+outcome
-              // (trader is selling — no point keeping our buy limits open)
               const pendingBuys = await (prisma as any).liveTrade.findMany({
                 where: {
                   sourceWalletAddress: walletAddress,
@@ -603,6 +658,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
                 }
               }
 
+              // Check if a partially/fully filled limit exists that we haven't marked FILLED yet
               if (!liveBuy) {
                 const liveOrder = await (prisma as any).liveTrade.findFirst({
                   where: {
@@ -624,19 +680,13 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
                     });
                     liveBuy = { ...liveOrder, status: 'FILLED' };
                     console.log(`[copy-trade] LIVE order ${liveOrder.orderId.slice(0, 16)}... matched → FILLED before SELL`);
-                    await ensureTakeProfitOrder(liveBuy);
                   } else if (clobStatus === 'live') {
-                    // Our limit order is still unfilled but the source trader already sold.
-                    // Cancel our pending BUY — no point buying what they dumped.
                     const cancelled = await cancelOrder(liveOrder.orderId);
-                    // After cancel, verify the order truly didn't fill (could have filled between check and cancel)
                     const statusAfterCancel = await getOrderStatus(liveOrder.orderId);
                     if (statusAfterCancel === 'matched') {
-                      // Filled between our check and cancel — treat as FILLED, sell immediately
                       await (prisma as any).liveTrade.update({ where: { id: liveOrder.id }, data: { status: 'FILLED' } });
                       liveBuy = { ...liveOrder, status: 'FILLED' };
                       console.log(`[copy-trade] LIVE BUY filled just before cancel — treating as FILLED, will SELL: ${marketTitle.slice(0, 45)}`);
-                      // Fall through to SELL logic below
                     } else {
                       await (prisma as any).liveTrade.update({
                         where: { id: liveOrder.id },
@@ -666,9 +716,65 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
                 }
               }
 
+              // Even with no DB match, check actual on-chain balance — limit may have partially filled
+              if (!liveBuy) {
+                const realShares = await getOwnLivePositionSize(tokenId);
+                if (realShares && realShares > 0) {
+                  console.log(`[copy-trade] Discovered ${realShares} real shares for ${marketTitle.slice(0, 45)} — creating synthetic FILLED record`);
+                  liveBuy = await (prisma as any).liveTrade.create({
+                    data: {
+                      userId: ownerUserId,
+                      sourceWalletAddress: walletAddress,
+                      conditionId: marketId,
+                      tokenId,
+                      marketTitle,
+                      outcome,
+                      side: 'BUY',
+                      price,
+                      size: realShares,
+                      usdcAmount: price * realShares,
+                      status: 'FILLED',
+                    },
+                  });
+                }
+              }
+
               if (!liveBuy) {
                 console.log(`[copy-trade] LIVE SELL skipped — no open BUY: ${marketTitle.slice(0, 45)} ${outcome} (${walletAddress.slice(0, 8)})`);
                 skipped++;
+                continue;
+              }
+
+              // --- Phase 2: sell real shares (requires VPN) ---
+              const regionOk = await isRegionAllowedForTrading();
+              if (!regionOk) {
+                // Can't sell right now, but record a FAILED SELL so retry picks it up later
+                const country = await getCurrentCountry();
+                const actualSize = await getOwnLivePositionSize(tokenId);
+                const currentSize = actualSize ?? liveBuy.size;
+                if (currentSize > 0) {
+                  await (prisma as any).liveTrade.create({
+                    data: {
+                      userId: ownerUserId,
+                      sourceWalletAddress: walletAddress,
+                      conditionId: marketId,
+                      tokenId,
+                      marketTitle,
+                      outcome,
+                      side: 'SELL',
+                      price,
+                      size: currentSize,
+                      usdcAmount: price * currentSize,
+                      status: 'FAILED',
+                      parentTradeId: liveBuy.id,
+                      errorMessage: `Region blocked (IP: ${country || 'unknown'}). Use VPN. Will retry.`,
+                    },
+                  });
+                  console.warn(`[copy-trade] LIVE SELL deferred (region blocked, ${currentSize}sh): ${marketTitle.slice(0, 45)} — will retry when VPN is up`);
+                } else {
+                  console.warn(`[copy-trade] LIVE SELL skipped (region blocked, 0 shares): ${marketTitle.slice(0, 45)}`);
+                }
+                errors++;
                 continue;
               }
 
@@ -914,7 +1020,7 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
   return { copied, skipped, errors };
 }
 
-async function retryFailedLiveTrades(): Promise<void> {
+export async function retryFailedLiveTrades(): Promise<void> {
   if (!isClobReady()) return;
   const regionOk = await isRegionAllowedForTrading();
   if (!regionOk) {
@@ -923,91 +1029,54 @@ async function retryFailedLiveTrades(): Promise<void> {
     return;
   }
 
+  // Only retry SELL orders — BUY retries are too risky (price may have moved)
   const failedTrades = await (prisma as any).liveTrade.findMany({
     where: {
       status: 'FAILED',
-      side: 'BUY',
+      side: 'SELL',
       createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
     },
     orderBy: { createdAt: 'desc' },
-    take: 10,
+    take: 15,
   });
 
   if (!failedTrades.length) return;
-  console.log(`[copy-trade] retrying ${failedTrades.length} failed live trades...`);
+  console.log(`[copy-trade] retrying ${failedTrades.length} failed SELL trades...`);
 
   for (const trade of failedTrades) {
     try {
-      // For BUY retries: skip if we already have a FILLED or LIVE BUY for this market/outcome
-      // This prevents infinite retry loops (e.g. near-resolved markets at 96¢)
-      if (trade.side === 'BUY') {
-        const alreadyOpen = await (prisma as any).liveTrade.findFirst({
-          where: {
-            conditionId: trade.conditionId,
-            outcome: trade.outcome,
-            side: 'BUY',
-            status: { in: ['FILLED', 'LIVE'] },
-          },
+      if (!trade.tokenId) {
+        await (prisma as any).liveTrade.update({
+          where: { id: trade.id },
+          data: { status: 'CLOSED', errorMessage: 'no tokenId' },
         });
-        if (alreadyOpen) {
-          await (prisma as any).liveTrade.update({
-            where: { id: trade.id },
-            data: { status: 'CANCELLED', errorMessage: 'duplicate: already have open position' },
-          });
-          console.log(`[copy-trade] RETRY BUY cancelled (already open): ${trade.marketTitle?.slice(0, 45)}`);
-          continue;
-        }
-        // Skip if price exceeds configured max — near-resolved market, no point retrying
-        const { maxPrice: maxCopyPrice } = await getGlobalPriceFilters();
-        if (trade.price > maxCopyPrice) {
-          await (prisma as any).liveTrade.update({
-            where: { id: trade.id },
-            data: { status: 'CANCELLED', errorMessage: `near-resolved market (price ${trade.price.toFixed(3)} > max ${maxCopyPrice}), skip` },
-          });
-          console.log(`[copy-trade] RETRY BUY cancelled (price=${trade.price.toFixed(3)} > max=${maxCopyPrice}): ${trade.marketTitle?.slice(0, 45)}`);
-          continue;
-        }
+        continue;
       }
 
-      // For SELL retries: check actual free shares before attempting (avoids repeating not enough balance)
+      // Check actual free shares before attempting
       let retrySize = trade.size;
-      if (trade.side === 'SELL' && trade.tokenId) {
-        const freeShares = await getOwnLivePositionSize(trade.tokenId);
-        if (freeShares === 0) {
-          // No free shares — position was closed by TP or manual sell; just mark parent BUY closed
+      const freeShares = await getOwnLivePositionSize(trade.tokenId);
+      if (freeShares === 0) {
+        await (prisma as any).liveTrade.update({
+          where: { id: trade.id },
+          data: { status: 'CLOSED', errorMessage: 'auto-closed: no free shares (sold by TP or manual)' },
+        });
+        if (trade.parentTradeId) {
           await (prisma as any).liveTrade.update({
-            where: { id: trade.id },
-            data: { status: 'CLOSED', errorMessage: 'auto-closed: no free shares (sold by TP or manual)' },
+            where: { id: trade.parentTradeId },
+            data: { status: 'CLOSED', size: 0, usdcAmount: 0 },
           });
-          // Also close the parent BUY if referenced
-          const parentBuy = await (prisma as any).liveTrade.findFirst({
-            where: { conditionId: trade.conditionId, outcome: trade.outcome, side: 'BUY', status: 'FILLED' },
-          });
-          if (parentBuy) {
-            await (prisma as any).liveTrade.update({
-              where: { id: parentBuy.id },
-              data: { status: 'CLOSED', size: 0, usdcAmount: 0 },
-            });
-          }
-          console.log(`[copy-trade] RETRY SELL skipped (no free shares, closed): ${trade.marketTitle?.slice(0, 40)}`);
-          continue;
         }
-        if (freeShares !== null) retrySize = freeShares;
+        console.log(`[copy-trade] RETRY SELL skipped (no free shares, closed): ${trade.marketTitle?.slice(0, 40)}`);
+        continue;
       }
+      if (freeShares !== null) retrySize = freeShares;
 
-      const copyW = await (prisma as any).copyWallet.findFirst({
-        where: { walletAddress: (trade.sourceWalletAddress || '').toLowerCase() },
-      });
-      const minS = walletMinShares(copyW || {});
+      // Use current ask price (sell-side of the book) so our limit sits at the ask, not the bid
+      const currentPrice = await getClobAskPrice(trade.tokenId);
+      const sellPrice = (currentPrice !== null && currentPrice > 0) ? currentPrice : trade.price;
 
-      const orderResult = trade.side === 'BUY'
-        ? await placeBuyOrder(
-            trade.tokenId,
-            trade.price,
-            Math.max(Number(trade.usdcAmount) || 0, minS * trade.price),
-            minS,
-          )
-        : await placeSellOrder(trade.tokenId, trade.price, retrySize);
+      const orderResult = await placeSellOrder(trade.tokenId, sellPrice, retrySize);
 
       let retryStatus = 'FAILED';
       if (orderResult.success) {
@@ -1019,30 +1088,37 @@ async function retryFailedLiveTrades(): Promise<void> {
       const isPermanent = !orderResult.success && orderResult.error &&
         permanentErrors.some(e => (orderResult.error || '').toLowerCase().includes(e));
 
-      // For SELLs: if market is gone, treat as closed not failed
-      const isSellMarketGone = trade.side === 'SELL' && isPermanent;
+      // Market gone (resolved) — just close, don't keep retrying
+      const isMarketGone = !orderResult.success && orderResult.error &&
+        permanentErrors.some(e => (orderResult.error || '').toLowerCase().includes(e));
 
       await (prisma as any).liveTrade.update({
         where: { id: trade.id },
         data: {
-          status: isSellMarketGone ? 'CLOSED' : (isPermanent ? 'CANCELLED' : retryStatus),
+          status: isMarketGone ? 'CLOSED' : retryStatus,
           orderId: orderResult.orderID || null,
           errorMessage: orderResult.error || null,
         },
       });
 
       if (orderResult.success) {
-        console.log(`[copy-trade] RETRY OK: ${trade.marketTitle.slice(0, 40)} orderId=${orderResult.orderID}`);
-        if (trade.copyTradeLogId) {
-          await (prisma as any).copyTradeLog.updateMany({
-            where: { demoTradeId: trade.id },
-            data: { status: 'COPIED' },
+        console.log(`[copy-trade] RETRY SELL OK: ${trade.marketTitle.slice(0, 40)} orderId=${orderResult.orderID}`);
+        if (trade.parentTradeId) {
+          await (prisma as any).liveTrade.update({
+            where: { id: trade.parentTradeId },
+            data: { status: 'CLOSED', size: 0, usdcAmount: 0 },
           });
         }
-      } else if (isPermanent) {
-        console.log(`[copy-trade] RETRY CANCELLED (permanent): ${trade.marketTitle.slice(0, 40)} — ${orderResult.error}`);
+      } else if (isMarketGone) {
+        if (trade.parentTradeId) {
+          await (prisma as any).liveTrade.update({
+            where: { id: trade.parentTradeId },
+            data: { status: 'CLOSED', size: 0, usdcAmount: 0 },
+          });
+        }
+        console.log(`[copy-trade] RETRY SELL closed (market gone): ${trade.marketTitle.slice(0, 40)}`);
       } else {
-        console.warn(`[copy-trade] RETRY FAILED: ${trade.marketTitle.slice(0, 40)} — ${orderResult.error}`);
+        console.warn(`[copy-trade] RETRY SELL failed: ${trade.marketTitle.slice(0, 40)} — ${orderResult.error}`);
       }
     } catch (e: any) {
       console.error(`[copy-trade] retry error: ${e.message}`);
@@ -1128,16 +1204,17 @@ async function syncLiveOrderStatuses(): Promise<void> {
 
 /**
  * Check if source traders have exited positions we still hold.
- * If trader's position is 0 shares, sell ours on CLOB.
+ * Handles both FILLED buys (sell shares) and LIVE buys (cancel limit + sell any partially filled shares).
+ * Runs every 70s, so even if VPN is down now, it will retry on the next cycle.
  */
 export async function syncTraderExits(): Promise<number> {
-  const filledBuys = await (prisma as any).liveTrade.findMany({
-    where: { side: 'BUY', status: 'FILLED', isTakeProfit: false },
+  const openBuys = await (prisma as any).liveTrade.findMany({
+    where: { side: 'BUY', status: { in: ['FILLED', 'LIVE'] }, isTakeProfit: false },
   });
-  if (filledBuys.length === 0) return 0;
+  if (openBuys.length === 0) return 0;
 
   let closed = 0;
-  for (const trade of filledBuys) {
+  for (const trade of openBuys) {
     try {
       if (!trade.sourceWalletAddress || !trade.conditionId) continue;
 
@@ -1147,23 +1224,57 @@ export async function syncTraderExits(): Promise<number> {
         headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' },
       });
       const positions = resp.data || [];
-      // positions=[] can mean "API returned no data" (e.g. wrong params) or "trader has no position here".
-      // We only act if we got at least one position record back (so the API is clearly responding for this market),
-      // OR if the trader specifically has a matching outcome with size=0.
-      if (positions.length === 0) {
-        // No data at all — could be API issue or market filtered differently. Skip to be safe.
-        continue;
-      }
+      if (positions.length === 0) continue;
       const matching = positions.find((p: any) =>
         (p.outcome || '').toUpperCase() === (trade.outcome || '').toUpperCase(),
       );
-
-      // If no matching outcome in the response but other outcomes are present — market data is there,
-      // trader just doesn't hold this outcome. Treat as exited (size=0).
       const traderSize = matching ? (matching.size || 0) : 0;
       if (traderSize > 0.5) continue; // trader still holds
 
-      // Trader exited — sell our position
+      // --- Trader exited this position ---
+
+      // For LIVE (unfilled) buys: cancel the limit order, then check for partial fills
+      if (trade.status === 'LIVE') {
+        if (trade.orderId) {
+          // Check if it actually filled before cancelling
+          const clobStatus = await getOrderStatus(trade.orderId);
+          if (clobStatus === 'matched') {
+            await (prisma as any).liveTrade.update({ where: { id: trade.id }, data: { status: 'FILLED' } });
+            trade.status = 'FILLED';
+            console.log(`[sync-exits] LIVE BUY actually filled: ${trade.marketTitle?.slice(0, 45)}`);
+            // Fall through to FILLED handling below
+          } else {
+            await cancelOrder(trade.orderId);
+            // Check real balance — limit may have partially filled
+            const realShares = trade.tokenId ? await getOwnLivePositionSize(trade.tokenId) : 0;
+            if (realShares && realShares > 0) {
+              // Partial fill — update record and fall through to sell
+              await (prisma as any).liveTrade.update({
+                where: { id: trade.id },
+                data: { status: 'FILLED', size: realShares, usdcAmount: trade.price * realShares },
+              });
+              trade.status = 'FILLED';
+              trade.size = realShares;
+              console.log(`[sync-exits] LIVE BUY cancelled but ${realShares}sh partially filled — will sell: ${trade.marketTitle?.slice(0, 45)}`);
+            } else {
+              await (prisma as any).liveTrade.update({
+                where: { id: trade.id },
+                data: { status: 'CANCELLED' },
+              });
+              closed++;
+              console.log(`[sync-exits] LIVE BUY cancelled (trader exited, unfilled): ${trade.marketTitle?.slice(0, 45)}`);
+              continue;
+            }
+          }
+        } else {
+          // No orderId — stale record
+          await (prisma as any).liveTrade.update({ where: { id: trade.id }, data: { status: 'CANCELLED' } });
+          closed++;
+          continue;
+        }
+      }
+
+      // --- FILLED buy: sell our shares ---
       if (!trade.tokenId) {
         await (prisma as any).liveTrade.update({ where: { id: trade.id }, data: { status: 'CLOSED' } });
         closed++;
@@ -1172,8 +1283,6 @@ export async function syncTraderExits(): Promise<number> {
       }
 
       await cancelPendingTakeProfitOrders(trade.id);
-
-      // Brief pause to let CLOB process cancellations before checking free shares
       await new Promise(r => setTimeout(r, 1500));
 
       const freeShares = await getOwnLivePositionSize(trade.tokenId);
@@ -1188,8 +1297,8 @@ export async function syncTraderExits(): Promise<number> {
         continue;
       }
 
-      // Check if market still tradeable
-      const clobPrice = await getClobPrice(trade.tokenId);
+      // Use ask price so our SELL limit sits at the ask, not dumps into the bid
+      const clobPrice = await getClobAskPrice(trade.tokenId);
       if (clobPrice === null) {
         await (prisma as any).liveTrade.update({ where: { id: trade.id }, data: { status: 'CLOSED' } });
         closed++;
@@ -1199,9 +1308,34 @@ export async function syncTraderExits(): Promise<number> {
 
       if (!isClobReady()) continue;
       const regionOk = await isRegionAllowedForTrading();
-      if (!regionOk) continue;
+      if (!regionOk) {
+        // Record a FAILED SELL so retryFailedLiveTrades picks it up when VPN is back
+        const existingFailedSell = await (prisma as any).liveTrade.findFirst({
+          where: { parentTradeId: trade.id, side: 'SELL', status: 'FAILED', isTakeProfit: false },
+        });
+        if (!existingFailedSell) {
+          await (prisma as any).liveTrade.create({
+            data: {
+              userId: trade.userId || null,
+              sourceWalletAddress: trade.sourceWalletAddress,
+              conditionId: trade.conditionId,
+              tokenId: trade.tokenId,
+              marketTitle: trade.marketTitle,
+              outcome: trade.outcome,
+              side: 'SELL',
+              price: clobPrice,
+              size: currentSize,
+              usdcAmount: clobPrice * currentSize,
+              status: 'FAILED',
+              parentTradeId: trade.id,
+              errorMessage: 'Region blocked — will retry when VPN is up',
+            },
+          });
+          console.warn(`[sync-exits] SELL deferred (region blocked, ${currentSize}sh): ${trade.marketTitle?.slice(0, 40)} — retry scheduled`);
+        }
+        continue;
+      }
 
-      // Skip if order value is below CLOB minimum ($1) or less than 5 shares
       if (currentSize < 5 || clobPrice * currentSize < 1) {
         console.log(`[sync-exits] Skipped (below CLOB min): ${trade.marketTitle?.slice(0, 40)} ${currentSize}sh@${clobPrice.toFixed(3)} val=$${(clobPrice * currentSize).toFixed(2)}`);
         continue;
@@ -1209,7 +1343,6 @@ export async function syncTraderExits(): Promise<number> {
 
       const orderResult = await placeSellOrder(trade.tokenId, clobPrice, currentSize);
 
-      // Orderbook gone (market resolved between our check and order placement) — just close
       const isMarketGone = !orderResult.success && orderResult.error &&
         (orderResult.error.toLowerCase().includes('does not exist') ||
          orderResult.error.toLowerCase().includes('no orderbook'));
@@ -1252,14 +1385,133 @@ export async function syncTraderExits(): Promise<number> {
   return closed;
 }
 
+/**
+ * Find real on-chain positions that have no matching open BUY in our DB (orphans).
+ * These happen when a BUY was marked CLOSED but the SELL never actually went through on CLOB.
+ * Attempts to sell them at current market price.
+ */
+export async function sweepOrphanPositions(): Promise<number> {
+  if (!isClobReady()) return 0;
+  const regionOk = await isRegionAllowedForTrading();
+  if (!regionOk) return 0;
+
+  const tradingUser = getTradingUserAddress();
+  if (!tradingUser) return 0;
+
+  let allPositions: any[];
+  try {
+    const resp = await axios.get('https://data-api.polymarket.com/positions', {
+      params: { user: tradingUser, sizeThreshold: 0 },
+      timeout: 15_000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' },
+    });
+    allPositions = (resp.data || []).filter((p: any) => Math.round(p.size || 0) >= 5);
+  } catch {
+    return 0;
+  }
+
+  if (!allPositions.length) return 0;
+
+  let sold = 0;
+  for (const pos of allPositions) {
+    try {
+      const tokenId = pos.asset;
+      const realSize = Math.round(pos.size || 0);
+      if (!tokenId || realSize < 5) continue;
+
+      // Check if we have an active BUY record for this token
+      const activeBuy = await (prisma as any).liveTrade.findFirst({
+        where: {
+          tokenId,
+          side: 'BUY',
+          status: { in: ['FILLED', 'LIVE'] },
+          isTakeProfit: false,
+        },
+      });
+      if (activeBuy) continue; // tracked — syncTraderExits handles this
+
+      // Check if there's already a pending SELL (TP or otherwise) for this token
+      const pendingSell = await (prisma as any).liveTrade.findFirst({
+        where: {
+          tokenId,
+          side: 'SELL',
+          status: { in: ['LIVE', 'PENDING'] },
+        },
+      });
+      if (pendingSell) continue; // already have a sell order out
+
+      // Check if there's a recent FAILED SELL we're already retrying
+      const recentFailedSell = await (prisma as any).liveTrade.findFirst({
+        where: {
+          tokenId,
+          side: 'SELL',
+          status: 'FAILED',
+          createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+        },
+      });
+      if (recentFailedSell) continue; // retry will handle it
+
+      // This is an orphan — real shares with no active DB record
+      // Find the original CLOSED BUY for context
+      const closedBuy = await (prisma as any).liveTrade.findFirst({
+        where: { tokenId, side: 'BUY', status: 'CLOSED' },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      const sellOrders = await getOpenSellOrders(tokenId);
+      const lockedInSells = sellOrders.reduce((sum, o) => sum + o.size_remaining, 0);
+      const freeShares = Math.max(realSize - Math.round(lockedInSells), 0);
+      if (freeShares < 5) continue;
+
+      // Use ask price so our SELL limit sits at the ask, not dumps into the bid
+      const clobPrice = await getClobAskPrice(tokenId);
+      if (clobPrice === null || clobPrice <= 0) continue;
+      if (clobPrice * freeShares < 1) continue; // below CLOB minimum
+
+      const title = closedBuy?.marketTitle || pos.title || tokenId.slice(0, 20);
+      console.log(`[orphan-sweep] Found ${freeShares}sh orphan: ${title.slice(0, 50)} @ ${clobPrice.toFixed(3)} (ask) — selling`);
+
+      const orderResult = await placeSellOrder(tokenId, clobPrice, freeShares);
+      if (orderResult.success) {
+        await (prisma as any).liveTrade.create({
+          data: {
+            userId: closedBuy?.userId || null,
+            sourceWalletAddress: closedBuy?.sourceWalletAddress || '',
+            conditionId: closedBuy?.conditionId || '',
+            tokenId,
+            marketTitle: title,
+            outcome: closedBuy?.outcome || pos.outcome || '',
+            side: 'SELL',
+            price: clobPrice,
+            size: freeShares,
+            usdcAmount: clobPrice * freeShares,
+            orderId: orderResult.orderID || null,
+            status: orderResult.status === 'matched' ? 'FILLED' : 'LIVE',
+          },
+        });
+        sold++;
+        console.log(`[orphan-sweep] SOLD: ${title.slice(0, 45)} ${freeShares}sh @ ${clobPrice.toFixed(3)} orderId=${orderResult.orderID}`);
+      } else {
+        console.warn(`[orphan-sweep] SELL failed: ${title.slice(0, 45)} — ${orderResult.error}`);
+      }
+    } catch {
+      // skip per-position errors
+    }
+  }
+  if (sold > 0) console.log(`[orphan-sweep] sold ${sold} orphan positions`);
+  return sold;
+}
+
 export function startCopyTradePoller() {
   setTimeout(() => retryFailedLiveTrades(), 5000);
-  // Check trader exits on startup (delayed to let CLOB initialize)
   setTimeout(() => syncTraderExits(), 15_000);
+  // Sweep orphan positions on startup (delayed) and every 3 minutes
+  setTimeout(() => sweepOrphanPositions(), 30_000);
   poll();
   setInterval(poll, POLL_INTERVAL_MS);
   setInterval(() => syncLiveOrderStatuses(), 45_000);
   setInterval(() => retryFailedLiveTrades(), 5 * 60 * 1000);
   setInterval(() => syncTraderExits(), 70_000);
-  console.log(`[copy-trade] poller started (interval: ${POLL_INTERVAL_MS / 1000}s, order sync: 45s, retry: 300s, exit sync: 70s)`);
+  setInterval(() => sweepOrphanPositions(), 3 * 60 * 1000);
+  console.log(`[copy-trade] poller started (interval: ${POLL_INTERVAL_MS / 1000}s, order sync: 45s, retry: 300s, exit sync: 70s, orphan sweep: 180s)`);
 }

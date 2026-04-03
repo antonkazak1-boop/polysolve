@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import prisma from '../../config/database';
 import { gammaClient } from '../../clients/gamma-client';
-import { poll, syncTraderExits, getClobPrice } from '../../services/copy-trade';
+import { poll, syncTraderExits, getClobPrice, sweepOrphanPositions, retryFailedLiveTrades } from '../../services/copy-trade';
 import { getClobStatus, cancelAllOrders, getTradingUserAddress, getTradingAddresses } from '../../clients/polymarket-clob';
 import { getCurrentCountry, getBlockedCountries } from '../../utils/region-guard';
 import { authMiddleware } from '../../middleware/auth';
@@ -541,6 +541,9 @@ copytradingRouter.post('/cancel-all', async (req: Request, res: Response) => {
   }
 });
 
+/** Ignore sub-1-share noise when flagging «desynced» (API / rounding dust). */
+const RECONCILE_MIN_MEANINGFUL_SHARES = 1;
+
 // GET /api/copytrading/reconcile — compare real Polymarket positions vs DB (для проверки актуальности)
 copytradingRouter.get('/reconcile', async (req: Request, res: Response) => {
   try {
@@ -549,10 +552,9 @@ copytradingRouter.get('/reconcile', async (req: Request, res: Response) => {
     if (!tradingUser) {
       return res.json({ ok: false, error: 'CLOB not configured', realPositions: [], dbOpenBuys: [], ghostCandidates: [], desynced: [] });
     }
-    // Polymarket API may return positions for proxy (funder) or for signer (EOA) — try both
-    const addressesToTry = [funder, signer].filter(Boolean) as string[];
+    // Merge positions from proxy (funder) AND signer — старый код брал только первый адрес с любыми позициями и мог пропустить основной кошелёк.
+    const addressesToTry = [...new Set([funder, signer].filter(Boolean) as string[])];
     const seenAssets = new Map<string, { asset: string; size: number; market?: string }>();
-    let usedAddress = '';
     for (const addr of addressesToTry) {
       const posResp = await axios.get('https://data-api.polymarket.com/positions', {
         params: { user: addr, sizeThreshold: 0 },
@@ -564,16 +566,31 @@ copytradingRouter.get('/reconcile', async (req: Request, res: Response) => {
         size: parseFloat(p.size || 0),
         market: p.market,
       }));
-      if (list.some((r) => r.size > 0)) {
-        usedAddress = addr;
-        list.forEach((r) => {
-          if (r.size > 0) seenAssets.set(r.asset, r);
-        });
-        break;
+      for (const r of list) {
+        if (r.size <= 0 || !r.asset) continue;
+        const prev = seenAssets.get(r.asset);
+        if (!prev) seenAssets.set(r.asset, { ...r });
+        else {
+          // Два адреса не должны дублировать один tokenId; если вдруг — берём max, не сумму (избегаем двойного учёта).
+          if (r.size > prev.size) seenAssets.set(r.asset, { asset: r.asset, size: r.size, market: r.market || prev.market });
+        }
       }
     }
-    const realPositions = Array.from(seenAssets.values());
+    const realPositions = Array.from(seenAssets.values()).filter((r) => r.size > 0);
     const realMap = new Map(realPositions.map((r) => [r.asset, r.size]));
+
+    const pendingSellRows = await (prisma as any).liveTrade.findMany({
+      where: {
+        userId: req.userId,
+        side: 'SELL',
+        status: { in: ['LIVE', 'PENDING'] },
+        tokenId: { not: null },
+      },
+      select: { tokenId: true },
+    });
+    const pendingSellAssets = new Set<string>(
+      pendingSellRows.map((x: any) => x.tokenId).filter(Boolean),
+    );
 
     const dbOpenBuys = await (prisma as any).liveTrade.findMany({
       where: { userId: req.userId, side: 'BUY', status: 'FILLED', isTakeProfit: false },
@@ -605,9 +622,10 @@ copytradingRouter.get('/reconcile', async (req: Request, res: Response) => {
     }
 
     for (const r of realPositions) {
-      if (r.size <= 0) continue;
+      if (r.size < RECONCILE_MIN_MEANINGFUL_SHARES) continue;
       const openMatch = dbOpenBuys.find((b: any) => b.tokenId === r.asset);
       if (openMatch) continue;
+      if (pendingSellAssets.has(r.asset)) continue; // выход в процессе — не считаем рассинхроном
       const closedMatch = dbClosedBuysByToken.get(r.asset);
       if (closedMatch) {
         desynced.push({
@@ -622,11 +640,15 @@ copytradingRouter.get('/reconcile', async (req: Request, res: Response) => {
 
     res.json({
       ok: true,
-      tradingUser: usedAddress || tradingUser,
+      tradingUser: addressesToTry[0] || tradingUser,
+      addressesChecked: addressesToTry,
       realPositionsCount: realPositions.length,
+      meaningfulPositionsCount: realPositions.filter((x) => x.size >= RECONCILE_MIN_MEANINGFUL_SHARES).length,
       dbOpenBuysCount: dbOpenBuys.length,
       ghostCandidates,
       desynced,
+      reconcileNote:
+        'Desynced = on-chain shares remain but DB has CLOSED buy for this token (often after a failed/partial sell). Ghost = DB open FILLED but 0 on-chain. Pending SELL orders are excluded from Desynced.',
       realPositions: realPositions.slice(0, 50),
     });
   } catch (err: any) {
@@ -642,4 +664,29 @@ copytradingRouter.post('/sync-exits', async (_req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: 'Sync failed', detail: err.message });
   }
+});
+
+// POST /api/copytrading/resync-positions — fire-and-forget full resync:
+// Returns 202 immediately; work runs in background (can take 30-120s for many positions).
+// 1. syncTraderExits: sell positions where source trader already exited
+// 2. sweepOrphanPositions: sell real on-chain shares with no DB record
+// 3. retryFailedLiveTrades: retry any previously failed SELL orders
+let _resyncRunning = false;
+copytradingRouter.post('/resync-positions', async (_req: Request, res: Response) => {
+  if (_resyncRunning) {
+    return res.status(202).json({ ok: true, status: 'already_running', message: 'Resync already in progress' });
+  }
+  res.status(202).json({ ok: true, status: 'started', message: 'Resync started in background — refresh positions in ~60s' });
+  _resyncRunning = true;
+  (async () => {
+    try {
+      const [closed, orphansSold] = await Promise.all([syncTraderExits(), sweepOrphanPositions()]);
+      await retryFailedLiveTrades();
+      console.log(`[resync-positions] done — exits closed: ${closed}, orphans sold: ${orphansSold}`);
+    } catch (err: any) {
+      console.error('[resync-positions] error:', err.message);
+    } finally {
+      _resyncRunning = false;
+    }
+  })();
 });

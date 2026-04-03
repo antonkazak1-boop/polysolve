@@ -18,6 +18,10 @@ import { cryptoRouter } from './api/routes/crypto';
 import { copytradingRouter } from './api/routes/copytrading';
 import { authRouter } from './api/routes/auth';
 import { adminRouter } from './api/routes/admin';
+import { lolPandascoreRouter } from './api/routes/lol-pandascore';
+import { lolGolggRouter } from './api/routes/lol-golgg';
+import { btcStrategyRouter } from './api/routes/btc-strategy';
+import { lolDraftRouter } from './api/routes/lol-draft-analysis';
 import { setupWebSocket } from './api/websocket';
 import { startCron } from './services/cron-scheduler';
 import { startActivityFeedPoller } from './services/activity-feed';
@@ -26,6 +30,14 @@ import { initClobClient, getClobStatus } from './clients/polymarket-clob';
 import { ensureAdminExists, ensureBootstrapAdminIfNoAdmin } from './services/auth';
 
 dotenv.config();
+
+// Prevent uncaught errors from killing the process
+process.on('uncaughtException', (err) => {
+  console.error('[server] uncaughtException (process kept alive):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[server] unhandledRejection (process kept alive):', reason);
+});
 
 const app = express();
 const httpServer = createServer(app);
@@ -58,6 +70,10 @@ app.use('/api/crypto', cryptoRouter);
 app.use('/api/copytrading', copytradingRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/lol', lolPandascoreRouter);
+app.use('/api/lol', lolGolggRouter);
+app.use('/api/btc-strategy', btcStrategyRouter);
+app.use('/api', lolDraftRouter);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -82,6 +98,14 @@ httpServer.listen(PORT, async () => {
 
   if (process.env.POLY_PRIVATE_KEY) {
     await initClobClient();
+    // init runs once at boot — if VPN was off or IP was blocked, CLOB stays "offline" until restart.
+    // Retry every 90s so turning VPN on later recovers without manual server restart.
+    setInterval(async () => {
+      if (!getClobStatus().ready && process.env.POLY_PRIVATE_KEY) {
+        const ok = await initClobClient();
+        if (ok) console.log('[clob] recovered after retry (VPN/region or keys now OK)');
+      }
+    }, 90_000);
   } else {
     console.log('[clob] POLY_PRIVATE_KEY not set — live trading disabled');
   }

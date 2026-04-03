@@ -514,6 +514,255 @@ model CopyTradeLog {
   @@map("copy_trade_logs")
 }
 
+// ─── gol.gg scraped stats ────────────────────────────────────────────────────
+
+// Top-league tournaments parsed from /tournament/tournament-matchlist/NAME/
+model GolTournament {
+  id          String   @id @default(uuid())
+  name        String   @unique   // e.g. "2026 First Stand"
+  region      String?
+  season      String?            // e.g. "S16"
+  nbGames     Int?
+  firstGame   String?
+  lastGame    String?
+  scrapedAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  matches     GolMatch[]
+
+  @@index([season])
+  @@map("gol_tournaments")
+}
+
+// Individual game results from tournament-matchlist page
+model GolMatch {
+  id             String   @id @default(uuid())
+  gameId         Int      @unique         // numeric id from gol.gg URL
+  tournamentId   String?
+  tournamentName String?
+  title          String?                  // "G2 Esports vs BLG"
+  team1          String?
+  team2          String?
+  winner         String?
+  score          String?                  // "1 - 3"
+  stage          String?                  // "FINALS", "GROUPS.DAY1"
+  patch          String?
+  gameDate       String?
+  scrapedAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tournament     GolTournament? @relation(fields: [tournamentId], references: [id])
+
+  @@index([tournamentId])
+  @@index([gameDate])
+  @@map("gol_matches")
+}
+
+// Champion stats from /champion/list/season-S16/split-ALL/tournament-ALL/
+model GolChampionStat {
+  id           String   @id @default(uuid())
+  season       String                     // "S16"
+  split        String   @default("ALL")
+  tournament   String   @default("ALL")
+  champion     String
+  picks        Int?
+  bans         Int?
+  prioScore    String?
+  wins         Int?
+  losses       Int?
+  winrate      String?
+  kda          String?
+  avgBt        String?  // avg blue side pick
+  avgRp        String?  // avg red side pick
+  bpPct        String?
+  avgGt        String?  // avg game time
+  csm          Float?
+  dpm          Float?
+  gpm          Float?
+  csd15        Float?
+  gd15         Float?
+  xpd15        Float?
+  scrapedAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([season, split, tournament, champion])
+  @@index([season, champion])
+  @@map("gol_champion_stats")
+}
+
+// Player stats from /players/list/season-S16/split-Winter/tournament-ALL/
+model GolPlayerStat {
+  id           String   @id @default(uuid())
+  season       String
+  split        String
+  tournament   String   @default("ALL")
+  playerId     Int?                       // numeric id from href
+  playerName   String
+  country      String?
+  games        Int?
+  winRate      String?
+  kda          String?
+  avgKills     Float?
+  avgDeaths    Float?
+  avgAssists   Float?
+  csm          Float?
+  gpm          Float?
+  kpPct        String?
+  dmgPct       String?
+  goldPct      String?
+  vsPct        String?
+  dpm          Float?
+  vspm         Float?
+  avgWpm       Float?
+  avgWcpm      Float?
+  avgVwpm      Float?
+  gd15         Float?
+  csd15        Float?
+  xpd15        Float?
+  fbPct        String?
+  fbVictim     String?
+  pentaKills   Int?
+  scrapedAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([season, split, tournament, playerName])
+  @@index([season, split])
+  @@index([playerName])
+  @@map("gol_player_stats")
+}
+
+// Per-player champion pool from /players/player-stats/{id}/season-…/split-…/tournament-…/ (gol.gg)
+model GolPlayerChampionStat {
+  id          String   @id @default(uuid())
+  season      String
+  split       String
+  tournament  String   @default("ALL")
+  playerId    Int
+  playerName  String?
+  championId  Int
+  champion    String
+  games       Int
+  winRate     String?
+  kda         String?
+  scrapedAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([season, split, tournament, playerId, championId])
+  @@index([playerId, season, split])
+  @@map("gol_player_champion_stats")
+}
+
+// Snapshot of a Games of Legends (gol.gg) match page — parsed charts + timeline for analysis / UI
+model GolGgGameSnapshot {
+  id        String   @id @default(uuid())
+  gameId    Int
+  pageSlug  String   @default("page-game")
+  sourceUrl String
+  title     String?
+  /// Teams, patch, game duration, winner line (from page headings / meta)
+  meta      String   @default("{}")
+  /// Chart.js payloads: goldOverTime, goldByRole, damageByRole, vision, jungleShare (counterData)
+  charts    String   @default("{}")
+  /// Parsed timeline: side, gameTime, label, iconFile
+  timeline  String   @default("[]")
+  /// Tower plates / voidgrubs row text as structured { raw, teams?, lines? }
+  plates    String?
+  /// Player stat rows: champion, player, kda, cs, items… (best-effort)
+  players   String?
+  fetchedAt DateTime @default(now())
+
+  @@unique([gameId, pageSlug])
+  @@index([fetchedAt])
+  @@map("gol_gg_game_snapshots")
+}
+
+// ─── Oracle's Elixir pro-match data ──────────────────────────────────────────
+
+// One row per game (12 source rows collapse into 1 game + 10 player rows)
+model OEGame {
+  id            String   @id @default(uuid())
+  gameId        String   @unique          // e.g. "LOLTMNT05_171038"
+  league        String
+  year          Int
+  split         String
+  playoffs      Boolean  @default(false)
+  date          DateTime
+  patch         String
+  gamelength    Int                        // seconds
+  blueTeam      String
+  redTeam       String
+  blueTeamId    String?
+  redTeamId     String?
+  blueResult    Int                        // 1 = win, 0 = loss
+  // Draft: ordered picks & bans
+  bluePick1     String?
+  bluePick2     String?
+  bluePick3     String?
+  bluePick4     String?
+  bluePick5     String?
+  redPick1      String?
+  redPick2      String?
+  redPick3      String?
+  redPick4      String?
+  redPick5      String?
+  blueBan1      String?
+  blueBan2      String?
+  blueBan3      String?
+  blueBan4      String?
+  blueBan5      String?
+  redBan1       String?
+  redBan2       String?
+  redBan3       String?
+  redBan4       String?
+  redBan5       String?
+  // Blue-side first pick
+  blueFirstPick Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  players       OEPlayerGame[]
+
+  @@index([patch])
+  @@index([league])
+  @@index([date])
+  @@index([blueTeam, redTeam])
+  @@map("oe_games")
+}
+
+// One row per player-game (10 per game: 5 blue + 5 red)
+model OEPlayerGame {
+  id            String   @id @default(uuid())
+  gameId        String
+  playername    String
+  playerid      String?
+  teamname      String
+  teamid        String?
+  side          String                     // Blue | Red
+  position      String                     // top | jng | mid | bot | sup
+  champion      String
+  result        Int                        // 1 = win
+  kills         Int      @default(0)
+  deaths        Int      @default(0)
+  assists       Int      @default(0)
+  dpm           Float?
+  cspm          Float?
+  gpm           Float?
+  vspm          Float?
+  golddiffat15  Float?
+  xpdiffat15    Float?
+  csdiffat15    Float?
+  damageshare   Float?
+  earnedgoldshare Float?
+
+  game          OEGame   @relation(fields: [gameId], references: [gameId], onDelete: Cascade)
+
+  @@index([gameId])
+  @@index([champion])
+  @@index([playername])
+  @@index([position])
+  @@index([teamname])
+  @@map("oe_player_games")
+}
+
 model StrategySignal {
   id              String   @id @default(uuid())
   strategy        String
@@ -531,4 +780,66 @@ model StrategySignal {
   @@index([marketId])
   @@index([createdAt])
   @@map("strategy_signals")
+}
+
+// Standalone 5m BTC direction predictions (synced to candle grid); survives restarts
+model BtcFiveMinPrediction {
+  id               Int      @id @default(autoincrement())
+  candleOpenTime   BigInt   @unique // ms UTC, aligned to 5m Binance candles
+  candleCloseTime  BigInt
+  generatedAt      DateTime
+  /// Binance BTCUSDT official OPEN of this 5m candle (window start)
+  spot             Float
+  direction        String // UP | DOWN
+  confidence       Int
+  probUp           Float
+  indicatorsJson   String   @default("{}")
+  resolved         Boolean  @default(false)
+  /// Binance BTCUSDT official CLOSE of this 5m candle when resolved
+  spotAtExpiry     Float?
+  actualDirection  String?
+  correct          Boolean?
+  changePct        Float?
+  /// CoinGecko BTC/USD snapshot near signal time (optional, for comparison to Polymarket-style USD)
+  refUsdOpen       Float?
+  refUsdClose      Float?
+
+  @@index([candleOpenTime])
+  @@index([resolved])
+  @@map("btc_five_min_predictions")
+}
+
+// BTC strategy auto-trader orders (dry-run and live); resolution + PnL persisted
+model BtcAutoTrade {
+  id             String    @id @default(uuid())
+  timestamp      DateTime
+  marketId       String
+  question       String
+  signal         String // BUY_YES | BUY_NO
+  tokenId        String
+  price          Float
+  size           Float
+  edge           Float
+  edgePct        Float
+  fairValue      Float
+  orderId        String?
+  status         String // placed | failed | dry_run
+  error          String?
+  expiryTime     BigInt?
+  resolved       Boolean   @default(false)
+  outcome        String? // win | loss
+  pnl            Float?
+  resolvedAt     DateTime?
+  resolvedPrice  Float?
+  spotAtEntry    Float?
+  spotAtExpiry   Float?
+  coin           String    @default("bitcoin")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([marketId])
+  @@index([resolved])
+  @@index([timestamp])
+  @@index([coin])
+  @@map("btc_auto_trades")
 }

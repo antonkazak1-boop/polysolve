@@ -4,7 +4,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002';
 
 const api = axios.create({
   baseURL: `${API_URL}/api`,
-  timeout: 30000,
+  timeout: 120_000, // 2 min for heavy DB queries (draft analysis)
 });
 
 // Inject auth token into every request
