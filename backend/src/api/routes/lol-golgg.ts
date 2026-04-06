@@ -2,11 +2,10 @@ import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import prisma from '../../config/database';
 import { buildGolGgUrl, parseGolGgHtml } from '../../services/golgg-parser';
-import { getTeamRatings, getWinProbability } from '../../services/lol-elo';
-import { getDraftAdjustment, getChampionPowerList } from '../../services/lol-draft';
 import { runMonteCarlo, SeriesFormat } from '../../services/lol-montecarlo';
 import { scanLoLMarkets } from '../../services/lol-market-scanner';
 import { predictMatch, scanEdges } from '../../services/lol-edge-calculator';
+import { getCompositeTeamRatings, getChampionPowerListComposite, predictMapComposite, DraftPick } from '../../services/lol-model';
 
 export const lolGolggRouter = Router();
 
@@ -216,20 +215,22 @@ lolGolggRouter.get('/golgg/stats/summary', async (_req: Request, res: Response) 
 
 // ─── Predictor endpoints ─────────────────────────────────────────────────────
 
-/** GET /golgg/predictor/ratings — current Elo ratings for all teams */
+/** GET /golgg/predictor/ratings — team strength from match history (replaces Elo) */
 lolGolggRouter.get('/golgg/predictor/ratings', async (_req: Request, res: Response) => {
   try {
-    const ratings = await getTeamRatings();
+    const ratings = await getCompositeTeamRatings();
     res.json({ count: ratings.length, ratings });
   } catch (e: unknown) {
     res.status(500).json({ error: (e as Error).message });
   }
 });
 
-/** GET /golgg/predictor/champions — champion power scores */
-lolGolggRouter.get('/golgg/predictor/champions', async (_req: Request, res: Response) => {
+/** GET /golgg/predictor/champions — champion meta power scores (multi-season) */
+lolGolggRouter.get('/golgg/predictor/champions', async (req: Request, res: Response) => {
   try {
-    const champions = await getChampionPowerList();
+    const seasonsRaw = req.query.seasons as string | undefined;
+    const seasons = seasonsRaw ? seasonsRaw.split(',') : undefined;
+    const champions = await getChampionPowerListComposite(seasons);
     res.json({ count: champions.length, champions });
   } catch (e: unknown) {
     res.status(500).json({ error: (e as Error).message });
@@ -257,7 +258,7 @@ lolGolggRouter.get('/golgg/predictor/edges', async (req: Request, res: Response)
   }
 });
 
-/** GET /golgg/predictor/edge?teamA=&teamB=&format=BO3 — single match prediction vs market */
+/** GET /golgg/predictor/edge?teamA=&teamB=&format=BO3 — single match prediction */
 lolGolggRouter.get('/golgg/predictor/edge', async (req: Request, res: Response) => {
   try {
     const teamA = req.query.teamA as string;
@@ -272,63 +273,82 @@ lolGolggRouter.get('/golgg/predictor/edge', async (req: Request, res: Response) 
 
     const prediction = await predictMatch(teamA, teamB, format, nSims);
 
-    const markets = await scanLoLMarkets();
-    const matching = markets.find((m) => {
-      const title = (m.eventTitle + ' ' + m.question).toLowerCase();
-      return (
-        m.type === 'match_winner' &&
-        title.includes(teamA.toLowerCase().split(' ')[0]) &&
-        title.includes(teamB.toLowerCase().split(' ')[0])
-      );
-    });
-
-    const pMarket = matching?.pMarketYes ?? null;
-    const edge = pMarket !== null ? prediction.pModel - pMarket : null;
+    let pMarket: number | null = null;
+    let edge: number | null = null;
+    try {
+      const markets = await scanLoLMarkets();
+      const matching = markets.find((m) => {
+        const title = (m.eventTitle + ' ' + m.question).toLowerCase();
+        return (
+          m.type === 'match_winner' &&
+          title.includes(teamA.toLowerCase().split(' ')[0]) &&
+          title.includes(teamB.toLowerCase().split(' ')[0])
+        );
+      });
+      pMarket = matching?.pMarketYes ?? null;
+      edge = pMarket !== null ? prediction.pModel - pMarket : null;
+    } catch { /* market scan optional */ }
 
     res.json({
       ...prediction,
       pMarket,
       edge: edge !== null ? Math.round(edge * 10000) / 10000 : null,
       edgePct: edge !== null ? `${edge >= 0 ? '+' : ''}${(edge * 100).toFixed(1)}%` : null,
-      matchingMarket: matching ?? null,
     });
   } catch (e: unknown) {
     res.status(500).json({ error: (e as Error).message });
   }
 });
 
-/** POST /golgg/predictor/draft — recalculate with champion draft */
+/**
+ * POST /golgg/predictor/draft — full prediction with draft + player names
+ *
+ * Body: {
+ *   teamA, teamB, format, nSims,
+ *   blueDraft: [{champion, player?}, ...],  // 5 picks
+ *   redDraft:  [{champion, player?}, ...],  // 5 picks
+ *   seasons?: ["S16","S15","S14"]
+ * }
+ *
+ * Also accepts legacy format: blueDraft: ["Rumble","Trundle",...], redDraft: [...]
+ */
 lolGolggRouter.post('/golgg/predictor/draft', async (req: Request, res: Response) => {
   try {
-    const { teamA, teamB, format, blueDraft, redDraft, nSims } = req.body ?? {};
+    const { teamA, teamB, format, blueDraft, redDraft, nSims, seasons } = req.body ?? {};
 
     if (!teamA || !teamB) {
       res.status(400).json({ error: 'teamA and teamB required' });
       return;
     }
     if (!Array.isArray(blueDraft) || !Array.isArray(redDraft)) {
-      res.status(400).json({ error: 'blueDraft and redDraft arrays required (5 champions each)' });
+      res.status(400).json({ error: 'blueDraft and redDraft arrays required (5 picks each)' });
       return;
     }
+
+    const toDraftPicks = (arr: unknown[]): DraftPick[] =>
+      arr.map(item => {
+        if (typeof item === 'string') return { champion: item };
+        const obj = item as { champion?: string; player?: string };
+        return { champion: obj.champion ?? '', player: obj.player };
+      });
+
+    const draftA = toDraftPicks(blueDraft);
+    const draftB = toDraftPicks(redDraft);
+    const seasonsArr = Array.isArray(seasons) ? seasons as string[] : undefined;
 
     const prediction = await predictMatch(
       teamA,
       teamB,
       format || 'BO3',
       nSims || 3000,
-      blueDraft,
-      redDraft,
+      draftA,
+      draftB,
+      undefined,
+      undefined,
+      seasonsArr,
     );
 
-    const { p_a: pBase } = await getWinProbability(teamA, teamB);
-
-    res.json({
-      ...prediction,
-      pBase: Math.round(pBase * 10000) / 10000,
-      pDraftDelta: prediction.draft?.adjustment
-        ? Math.round(prediction.draft.adjustment * 10000) / 10000
-        : 0,
-    });
+    res.json(prediction);
   } catch (e: unknown) {
     res.status(500).json({ error: (e as Error).message });
   }
@@ -337,22 +357,24 @@ lolGolggRouter.post('/golgg/predictor/draft', async (req: Request, res: Response
 /** POST /golgg/predictor/simulate — raw MC simulation */
 lolGolggRouter.post('/golgg/predictor/simulate', async (req: Request, res: Response) => {
   try {
-    const { teamA, teamB, format, pMap, pMapRest, nSims } = req.body ?? {};
+    const { teamA, teamB, format, pMap, pMapRest, nSims, startA, startB } = req.body ?? {};
 
     let resolvedPMap = Number(pMap);
     if (!resolvedPMap || resolvedPMap <= 0 || resolvedPMap >= 1) {
       if (teamA && teamB) {
-        const { p_a } = await getWinProbability(teamA, teamB);
-        resolvedPMap = p_a;
+        const comp = await predictMapComposite({ teamA, teamB });
+        resolvedPMap = comp.pMap;
       } else {
         resolvedPMap = 0.5;
       }
     }
 
-    // pMapRest: win prob for maps 2+ (draft unknown). Falls back to pMap if not provided.
     const resolvedPMapRest = (Number(pMapRest) > 0 && Number(pMapRest) < 1)
       ? Number(pMapRest)
       : resolvedPMap;
+
+    const sA = Math.max(0, Math.min(Number(startA) || 0, 4));
+    const sB = Math.max(0, Math.min(Number(startB) || 0, 4));
 
     const result = runMonteCarlo(
       teamA || 'Team A',
@@ -361,9 +383,43 @@ lolGolggRouter.post('/golgg/predictor/simulate', async (req: Request, res: Respo
       format || 'BO3',
       Math.min(Math.max(Number(nSims) || 3000, 1), 200_000),
       resolvedPMapRest,
+      sA,
+      sB,
     );
 
     res.json(result);
+  } catch (e: unknown) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+/** GET /golgg/predictor/players?q=search — search player names for autocomplete */
+lolGolggRouter.get('/golgg/predictor/players', async (req: Request, res: Response) => {
+  try {
+    const q = (req.query.q as string || '').trim();
+    const seasonsRaw = req.query.seasons as string | undefined;
+    const seasons = seasonsRaw ? seasonsRaw.split(',') : ['S16', 'S15', 'S14'];
+    if (!q || q.length < 2) {
+      res.json({ players: [] });
+      return;
+    }
+    const players = await prisma.golPlayerStat.findMany({
+      where: { playerName: { contains: q }, season: { in: seasons } },
+      select: { playerName: true, season: true, games: true },
+      orderBy: { games: 'desc' },
+      take: 50,
+    });
+    const unique = new Map<string, { name: string; games: number; seasons: string[] }>();
+    for (const p of players) {
+      const existing = unique.get(p.playerName);
+      if (existing) {
+        existing.games += p.games || 0;
+        if (!existing.seasons.includes(p.season)) existing.seasons.push(p.season);
+      } else {
+        unique.set(p.playerName, { name: p.playerName, games: p.games || 0, seasons: [p.season] });
+      }
+    }
+    res.json({ players: [...unique.values()].sort((a, b) => b.games - a.games).slice(0, 20) });
   } catch (e: unknown) {
     res.status(500).json({ error: (e as Error).message });
   }

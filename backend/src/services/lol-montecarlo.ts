@@ -27,23 +27,31 @@ const BLUE_SIDE_BONUS = 0.01; // ~1% blue side advantage in pro play
 /**
  * pMap1  — map 1 win prob (draft-adjusted)
  * pMapRest — maps 2+ win prob (no draft known, defaults to pMap1 for backwards compat)
+ * startA / startB — maps already won (partial score, e.g. 1-0 in a BO5)
  */
-function simulateSeries(pMap1: number, format: SeriesFormat, pMapRest: number): [number, number] {
+function simulateSeries(
+  pMap1: number,
+  format: SeriesFormat,
+  pMapRest: number,
+  startA: number = 0,
+  startB: number = 0,
+): [number, number] {
   const target = WINS_NEEDED[format];
-  let winsA = 0;
-  let winsB = 0;
-  let mapIndex = 0;
+  let winsA = startA;
+  let winsB = startB;
+  const mapsPlayed = startA + startB;
 
   while (winsA < target && winsB < target) {
+    const mapIndex = (winsA - startA) + (winsB - startB);
+    const totalMap = mapsPlayed + mapIndex;
+    // First remaining map uses draft-adjusted pMap; subsequent use pMapRest
     const baseP = mapIndex === 0 ? pMap1 : pMapRest;
-    // Alternate blue side: even maps → teamA is blue, odd → teamB is blue
-    const blueSideForA = mapIndex % 2 === 0;
+    const blueSideForA = totalMap % 2 === 0;
     const pThisMap = blueSideForA ? baseP + BLUE_SIDE_BONUS : baseP - BLUE_SIDE_BONUS;
     const clamped = Math.max(0.01, Math.min(0.99, pThisMap));
 
     if (Math.random() < clamped) winsA++;
     else winsB++;
-    mapIndex++;
   }
 
   return [winsA, winsB];
@@ -57,6 +65,10 @@ export function runMonteCarlo(
   nSims: number = 3000,
   /** Win prob for maps 2+ (unknown draft). Defaults to pMap (old behaviour). */
   pMapRest: number = pMap,
+  /** Maps already won by teamA (partial score, e.g. 1 if Blue leads 1-0). */
+  startA: number = 0,
+  /** Maps already won by teamB. */
+  startB: number = 0,
 ): MCResult {
   const start = performance.now();
   const scoreCounts = new Map<string, number>();
@@ -64,7 +76,7 @@ export function runMonteCarlo(
   let totalMaps = 0;
 
   for (let i = 0; i < nSims; i++) {
-    const [wA, wB] = simulateSeries(pMap, format, pMapRest);
+    const [wA, wB] = simulateSeries(pMap, format, pMapRest, startA, startB);
     const key = `${wA}-${wB}`;
     scoreCounts.set(key, (scoreCounts.get(key) ?? 0) + 1);
     if (wA > wB) teamAWins++;

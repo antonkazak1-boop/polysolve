@@ -19,6 +19,31 @@ const MAX_SEEN_KEYS = 5000;
 const MAX_BUY_AGE_MS = 30 * 60 * 1000; // 30 min
 /** SELLs we process up to this old — so we close positions even after app was off for hours. */
 const MAX_SELL_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * Allowed drift between the trader's entry price and the current CLOB ask.
+ * Uses an absolute cent-based threshold that shrinks as the signal ages —
+ * fresh signals (< 2 min) get more slack, stale ones (> 20 min) almost none.
+ *
+ * Max allowed drift = BASE_DRIFT_CENTS − age_penalty, floored at MIN_DRIFT_CENTS.
+ *   age 0 min  → 5¢ slack  (signal is live, small spread is fine)
+ *   age 5 min  → 4¢ slack
+ *   age 10 min → 3¢ slack
+ *   age 20 min → 2¢ slack  (minimum — always allow a tiny spread)
+ *   age 30 min → 2¢ (capped; beyond MAX_BUY_AGE_MS the trade is skipped anyway)
+ *
+ * Absolute-cent approach avoids the asymmetry of %-based guards:
+ *   %-guard: $0.11 entry + 20% = $0.132 (2¢), $0.80 entry + 20% = $0.96 (16¢ — way too loose)
+ *   cent-guard: same 3¢ regardless of entry price → consistent execution quality
+ */
+const BASE_DRIFT_CENTS  = 0.05; // 5¢ for a fresh signal
+const MIN_DRIFT_CENTS   = 0.02; // 2¢ floor — always allow a tiny spread
+const DRIFT_DECAY_PER_MIN = 0.001; // lose 0.1¢ per minute of signal age
+
+function maxAllowedDrift(tradeAgeMs: number): number {
+  const ageMin = tradeAgeMs / 60_000;
+  return Math.max(MIN_DRIFT_CENTS, BASE_DRIFT_CENTS - ageMin * DRIFT_DECAY_PER_MIN);
+}
 /** Fallback price filters if DB settings not loaded yet */
 const DEFAULT_MIN_COPY_PRICE = 0.004;
 const DEFAULT_MAX_COPY_PRICE = 0.95;
@@ -462,13 +487,44 @@ export async function poll(): Promise<{ copied: number; skipped: number; errors:
           }
 
           try {
+            // ── Stale-signal guard + limit order at trader's price ─────────────────
+            // trader's `price` is their historical entry (could be minutes or days old).
+            // We fetch the current ask to detect drift, but we ALWAYS place our
+            // limit order at the trader's original price — never paying more.
+            // Allowed drift shrinks with signal age (see maxAllowedDrift).
+            if (tokenId && isLive && price > 0) {
+              const currentAsk = await getClobAskPrice(tokenId);
+              if (currentAsk !== null) {
+                const drift = currentAsk - price;
+                const allowed = maxAllowedDrift(tradeAgeMs);
+                if (drift > allowed) {
+                  console.log(
+                    `[copy-trade] BUY skipped (drift=${(drift * 100).toFixed(1)}¢ > ${(allowed * 100).toFixed(1)}¢ allowed for ${Math.round(tradeAgeMs / 60_000)}min-old signal | ask=${currentAsk.toFixed(3)} entry=${price.toFixed(3)}): ${marketTitle.slice(0, 50)}`
+                  );
+                  skipped++;
+                  continue;
+                }
+              }
+            }
+
+            // Always use trader's original entry price as our limit — we never overpay.
             const copyPrice = price;
             const maxAmount = Number(w.amountPerTrade) || 1;
             const scale = Number(w.copyScale) || 1;
             let amount = computeCopyAmount(raw, maxAmount, scale);
             const minS = walletMinShares(w);
             const minUsdForShares = minS * copyPrice;
+            // minOrderShares can push amount above amountPerTrade — cap it hard.
+            // If even the CLOB minimum (5 shares) exceeds amountPerTrade, skip the trade.
+            if (minUsdForShares > maxAmount) {
+              console.log(
+                `[copy-trade] BUY skipped (minShares=${minS} @ ${copyPrice.toFixed(3)} = $${minUsdForShares.toFixed(2)} exceeds amountPerTrade $${maxAmount.toFixed(2)}): ${marketTitle.slice(0, 50)}`
+              );
+              skipped++;
+              continue;
+            }
             if (amount < minUsdForShares) amount = minUsdForShares;
+            amount = Math.min(amount, maxAmount); // hard cap — never exceed per-trade limit
             const sourceUsd = parseFloat(raw.usdcSize) || 0;
 
             if (isLive) {

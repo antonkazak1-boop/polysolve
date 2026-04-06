@@ -561,6 +561,12 @@ export default function LolPandascorePage() {
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
           <Link
+            href="/lol/live"
+            className="text-sm text-purple-400 hover:text-purple-300 border border-purple-500/30 rounded-lg px-3 py-2"
+          >
+            Live Predictor
+          </Link>
+          <Link
             href="/lol/golgg"
             className="text-sm text-gray-400 hover:text-gray-200 border border-gray-700 rounded-lg px-3 py-2"
           >

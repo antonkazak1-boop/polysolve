@@ -30,6 +30,10 @@ export interface MatchupStat {
   champion: string;
   opponent: string;
   position: string;
+  /** Position of the opponent ('top','jng',...). Same as position for lane matchups. */
+  opponentPosition: string;
+  /** 'lane' = same-position head-to-head, 'cross' = different-position influence. */
+  kind: 'lane' | 'cross';
   games: number;
   wins: number;
   winRate: number;
@@ -235,15 +239,37 @@ function rolePairWeight(posA: string, posB: string): number {
   return ROLE_PAIR_WEIGHTS[key] ?? 1.0;
 }
 
-// ─── Player comfort coefficient ──────────────────────────────────────────────
-// Raw comfort: composite of experience, win rate, and KDA.
-// Normalized per player so best champ = 1.0.
+// ─── Draft sample confidence tuning ──────────────────────────────────────────
+// Centralised constants — tweak after backtests.
 
-function computeRawComfort(games: number, winRate: number, kda: number): number {
-  const expScore = Math.min(Math.log2(games + 1) / Math.log2(51), 1.0);
+/** Games needed for full mastery/comfort reliability on a champion. */
+const G_MASTERY_FULL = 15;
+/** Min games on a champion to be eligible for "best champ = 1.0" normalization. */
+const G_NORM_MIN = 5;
+/** Reference game count for synergy pair confidence (ramp 0→1). */
+const N_REF_SYNERGY = 15;
+/** Reference game count for matchup confidence (ramp 0→1). */
+const N_REF_MATCHUP = 10;
+/** Weight of a direct-lane (same position) matchup in the composite matchup score. */
+const W_LANE = 1.0;
+/** Weight of a cross-position matchup (e.g. top vs enemy jungler). */
+const W_CROSS = 0.33;
+
+/** Sample confidence: linear ramp 0→1 over `nRef` games, capped at 1. */
+function sampleConfidence(games: number, nRef: number): number {
+  return Math.min(1, games / nRef);
+}
+
+// ─── Player comfort coefficient ──────────────────────────────────────────────
+
+function computeRawComfort(games: number, winRate: number, kda: number, totalPlayerGames: number): number {
+  // Share of the player's total games on this champion (relative experience).
+  // A player with 10 total games and 5 on Renekton → shareScore ≈ 1.0
+  const share = totalPlayerGames > 0 ? games / totalPlayerGames : 0;
+  const shareScore = Math.min(share * 2, 1.0);
   const wrScore = Math.max(0, Math.min(1, winRate));
   const kdaScore = Math.min(kda / 5.0, 1.0);
-  return expScore * 0.35 + wrScore * 0.40 + kdaScore * 0.25;
+  return shareScore * 0.40 + wrScore * 0.40 + kdaScore * 0.20;
 }
 
 /** Comfort when player has no recorded pro games on the drafted champion (counts in mastery average). */
@@ -324,7 +350,7 @@ export async function getChampionWinRates(
 
 // ─── 2. Champion synergy (weighted) ──────────────────────────────────────────
 
-export async function getChampionSynergies(minGames: number = 5, weights?: Partial<DraftWeightsConfig>): Promise<Map<string, SynergyPair>> {
+export async function getChampionSynergies(minGames: number = 2, weights?: Partial<DraftWeightsConfig>): Promise<Map<string, SynergyPair>> {
   const cfg = resolveDraftWeights(weights);
   const games = await prisma.oEGame.findMany({
     select: {
@@ -373,9 +399,11 @@ export async function getChampionSynergies(minGames: number = 5, weights?: Parti
   return result;
 }
 
-// ─── 3. Lane matchups (weighted) ─────────────────────────────────────────────
+// ─── 3. Matchups — all 5v5 cross-team pairs (weighted) ───────────────────────
+// Key: myChamp|oppChamp|myPosition — includes both same-position (lane) and
+// cross-position matchups so scoreSide can weigh them differently.
 
-export async function getLaneMatchups(minGames: number = 3, weights?: Partial<DraftWeightsConfig>): Promise<Map<string, MatchupStat>> {
+export async function getLaneMatchups(minGames: number = 1, weights?: Partial<DraftWeightsConfig>): Promise<Map<string, MatchupStat>> {
   const cfg = resolveDraftWeights(weights);
   const LANE_POSITIONS = ['top', 'jng', 'mid', 'bot', 'sup'];
 
@@ -388,41 +416,48 @@ export async function getLaneMatchups(minGames: number = 3, weights?: Partial<Dr
     },
   });
 
-  const byGamePos = new Map<string, typeof playerGames>();
+  // Group rows by gameId → side so we can pair every player against every opponent.
+  type PG = (typeof playerGames)[number];
+  const byGame = new Map<string, { blue: PG[]; red: PG[] }>();
   for (const pg of playerGames) {
-    const key = `${pg.gameId}|${pg.position}`;
-    const arr = byGamePos.get(key) ?? [];
-    arr.push(pg);
-    byGamePos.set(key, arr);
+    const entry = byGame.get(pg.gameId) ?? { blue: [], red: [] };
+    if (pg.side === 'Blue') entry.blue.push(pg);
+    else entry.red.push(pg);
+    byGame.set(pg.gameId, entry);
   }
 
   const matchupStats = new Map<string, {
     wGames: number; wWins: number; rawGames: number; rawWins: number;
     wGd15: number; wCsd15: number; wXpd15: number; wStatCount: number;
+    oppPos: string;
   }>();
 
-  for (const [, pair] of byGamePos) {
-    if (pair.length !== 2) continue;
-    const [a, b] = pair[0].side === 'Blue' ? [pair[0], pair[1]] : [pair[1], pair[0]];
+  for (const [, sides] of byGame) {
+    if (sides.blue.length !== 5 || sides.red.length !== 5) continue;
 
-    const addMatchup = (me: typeof a, opp: typeof b) => {
-      const w = gameWeight(me.game.league, me.game.year, cfg);
-      const key = `${me.champion.toLowerCase()}|${opp.champion.toLowerCase()}|${me.position}`;
-      const s = matchupStats.get(key) ?? { wGames: 0, wWins: 0, rawGames: 0, rawWins: 0, wGd15: 0, wCsd15: 0, wXpd15: 0, wStatCount: 0 };
-      s.wGames += w;
-      s.rawGames++;
-      if (me.result === 1) { s.wWins += w; s.rawWins++; }
-      if (me.golddiffat15 != null) {
-        s.wGd15 += me.golddiffat15 * w;
-        s.wCsd15 += (me.csdiffat15 ?? 0) * w;
-        s.wXpd15 += (me.xpdiffat15 ?? 0) * w;
-        s.wStatCount += w;
+    const addPairs = (myTeam: PG[], oppTeam: PG[]) => {
+      for (const me of myTeam) {
+        const w = gameWeight(me.game.league, me.game.year, cfg);
+        for (const opp of oppTeam) {
+          const key = `${me.champion.toLowerCase()}|${opp.champion.toLowerCase()}|${me.position}`;
+          const s = matchupStats.get(key) ?? { wGames: 0, wWins: 0, rawGames: 0, rawWins: 0, wGd15: 0, wCsd15: 0, wXpd15: 0, wStatCount: 0, oppPos: opp.position };
+          s.wGames += w;
+          s.rawGames++;
+          if (me.result === 1) { s.wWins += w; s.rawWins++; }
+          if (me.golddiffat15 != null && me.position === opp.position) {
+            s.wGd15 += me.golddiffat15 * w;
+            s.wCsd15 += (me.csdiffat15 ?? 0) * w;
+            s.wXpd15 += (me.xpdiffat15 ?? 0) * w;
+            s.wStatCount += w;
+          }
+          s.oppPos = opp.position;
+          matchupStats.set(key, s);
+        }
       }
-      matchupStats.set(key, s);
     };
 
-    addMatchup(a, b);
-    addMatchup(b, a);
+    addPairs(sides.blue, sides.red);
+    addPairs(sides.red, sides.blue);
   }
 
   const result = new Map<string, MatchupStat>();
@@ -433,17 +468,22 @@ export async function getLaneMatchups(minGames: number = 3, weights?: Partial<Dr
     const avgGD15 = s.wStatCount > 0 ? s.wGd15 / s.wStatCount : 0;
     const avgCSD15 = s.wStatCount > 0 ? s.wCsd15 / s.wStatCount : 0;
     const avgXPD15 = s.wStatCount > 0 ? s.wXpd15 / s.wStatCount : 0;
+    const isLane = pos === s.oppPos;
 
     let scalingTag: 'early' | 'scaling' | 'neutral' = 'neutral';
-    if (avgGD15 < -100 && wr > 0.5) scalingTag = 'scaling';
-    else if (avgGD15 > 200 && wr < 0.5) scalingTag = 'early';
+    if (isLane) {
+      if (avgGD15 < -100 && wr > 0.5) scalingTag = 'scaling';
+      else if (avgGD15 > 200 && wr < 0.5) scalingTag = 'early';
+    }
 
     const wrComponent = (wr - 0.5) * 0.7;
-    const laneComponent = (avgGD15 / 500) * 0.05 * 0.3;
+    const laneComponent = isLane ? (avgGD15 / 500) * 0.05 * 0.3 : 0;
     const adjustedAdvantage = wrComponent + laneComponent;
 
     result.set(key, {
       champion: champ, opponent: opp, position: pos,
+      opponentPosition: s.oppPos,
+      kind: isLane ? 'lane' : 'cross',
       games: s.rawGames, wins: s.rawWins,
       winRate: wr, avgGD15, avgCSD15, avgXPD15,
       scalingTag, adjustedAdvantage,
@@ -456,9 +496,12 @@ export async function getLaneMatchups(minGames: number = 3, weights?: Partial<Dr
 // ─── 4. Player champion mastery (weighted) ───────────────────────────────────
 
 export async function getPlayerMastery(playerNames: string[], weights?: Partial<DraftWeightsConfig>): Promise<Map<string, PlayerChampionMastery[]>> {
+  const names = [...new Set(playerNames.map((n) => n.trim()).filter(Boolean))];
+  if (names.length === 0) return new Map();
+
   const cfg = resolveDraftWeights(weights);
   const rows = await prisma.oEPlayerGame.findMany({
-    where: { playername: { in: playerNames } },
+    where: { playername: { in: names } },
     select: {
       playername: true, champion: true, result: true,
       kills: true, deaths: true, assists: true,
@@ -494,14 +537,25 @@ export async function getPlayerMastery(playerNames: string[], weights?: Partial<
 
   const result = new Map<string, PlayerChampionMastery[]>();
   for (const [player, champMap] of stats) {
+    // Total games across all champions for this player
+    let totalPlayerGames = 0;
+    for (const [, s] of champMap) totalPlayerGames += s.rawGames;
+
+    // Player's overall weighted WR — used as baseline for wrDelta (compare within player, not global)
+    let playerTotalWGames = 0;
+    let playerTotalWWins = 0;
+    for (const [, s] of champMap) {
+      playerTotalWGames += s.wGames;
+      playerTotalWWins += s.wWins;
+    }
+    const playerAvgWR = playerTotalWGames > 0 ? playerTotalWWins / playerTotalWGames : 0.5;
+
     const masteries: PlayerChampionMastery[] = [];
     for (const [champ, s] of champMap) {
       if (s.rawGames < 1) continue;
       const avgDeaths = s.deaths / s.rawGames;
       const kda = avgDeaths > 0 ? (s.kills / s.rawGames + s.assists / s.rawGames) / avgDeaths : (s.kills + s.assists) / s.rawGames;
       const wr = s.wGames > 0 ? s.wWins / s.wGames : 0.5;
-
-      // Comfort uses raw (unweighted) career stats so all seasons count equally
       const rawWr = s.rawGames > 0 ? s.rawWins / s.rawGames : 0.5;
 
       masteries.push({
@@ -512,12 +566,13 @@ export async function getPlayerMastery(playerNames: string[], weights?: Partial<
         avgGD15: s.gd15Count > 0 ? Math.round(s.gd15 / s.gd15Count) : 0,
         avgDPM: s.dpmCount > 0 ? Math.round(s.dpm / s.dpmCount) : 0,
         avgCSPM: s.cspmCount > 0 ? Math.round((s.cspm / s.cspmCount) * 10) / 10 : 0,
-        wrDelta: 0,
-        comfortCoeff: computeRawComfort(s.rawGames, rawWr, kda),
+        wrDelta: Math.round((wr - playerAvgWR) * 10000) / 10000,
+        comfortCoeff: computeRawComfort(s.rawGames, rawWr, kda, totalPlayerGames),
       });
     }
 
-    // Normalize comfort so best champion = 1.0
+    // Always normalize within the player: best champion = 1.0.
+    // Comfort is relative — 5/10 games on Renekton is the player's main pick.
     const maxComfort = masteries.reduce((mx, m) => Math.max(mx, m.comfortCoeff), 0);
     if (maxComfort > 0) {
       for (const m of masteries) {
@@ -530,6 +585,49 @@ export async function getPlayerMastery(playerNames: string[], weights?: Partial<
   }
 
   return result;
+}
+
+// ─── Picker lists + case-insensitive player resolution (SQLite) ─────────────
+
+/** Map typed nickname → canonical `playername` as stored in OE (case-insensitive). */
+export async function resolveOePlayerName(raw: string): Promise<string> {
+  const t = raw.trim();
+  if (!t) return '';
+  const rows = await prisma.$queryRaw<{ playername: string }[]>`
+    SELECT playername FROM oe_player_games
+    WHERE LOWER(TRIM(playername)) = LOWER(${t})
+    GROUP BY playername
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+  `;
+  return rows[0]?.playername ?? t;
+}
+
+/** All distinct champions in OE (for draft UI combobox). */
+export async function getOeChampionsForPicker(): Promise<{ champion: string; games: number }[]> {
+  const rows = await prisma.oEPlayerGame.groupBy({
+    by: ['champion'],
+    _count: { _all: true },
+    orderBy: { champion: 'asc' },
+  });
+  return rows.map((r) => ({ champion: r.champion, games: r._count._all }));
+}
+
+/** Search pro players by substring; `LOWER(playername) LIKE %q%` (case-insensitive). */
+export async function searchOePlayersForPicker(q: string, limit: number = 25): Promise<{ name: string; games: number }[]> {
+  const t = q.trim();
+  if (t.length < 1) return [];
+  const pattern = `%${t.toLowerCase()}%`;
+  const take = Math.min(Math.max(limit, 1), 50);
+  const rows = await prisma.$queryRaw<{ playername: string; cnt: bigint }[]>`
+    SELECT playername, COUNT(*) AS cnt
+    FROM oe_player_games
+    WHERE LOWER(playername) LIKE ${pattern}
+    GROUP BY playername
+    ORDER BY cnt DESC
+    LIMIT ${take}
+  `;
+  return rows.map((r) => ({ name: r.playername, games: Number(r.cnt) }));
 }
 
 // ─── Full draft analysis ─────────────────────────────────────────────────────
@@ -549,15 +647,25 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
   const positions = input.positions ?? ['top', 'jng', 'mid', 'bot', 'sup'];
   const weights = resolveDraftWeights(input.weights);
   const scoreMix = resolveScoreMix(input.scoreMix);
+
+  let bluePlayers = input.bluePlayers;
+  let redPlayers = input.redPlayers;
+  if (Array.isArray(bluePlayers) && bluePlayers.length === 5) {
+    bluePlayers = await Promise.all(bluePlayers.map((n) => resolveOePlayerName(n ?? '')));
+  }
+  if (Array.isArray(redPlayers) && redPlayers.length === 5) {
+    redPlayers = await Promise.all(redPlayers.map((n) => resolveOePlayerName(n ?? '')));
+  }
+
   const metaPatches = await recentPatches(5);
   const wSummary = formatWeightsSummary(weights);
 
   const [champWRs, synergies, matchups, blueMastery, redMastery] = await Promise.all([
     getChampionWinRates(metaPatches, 5, weights),
-    getChampionSynergies(5, weights),
-    getLaneMatchups(3, weights),
-    input.bluePlayers ? getPlayerMastery(input.bluePlayers, weights) : Promise.resolve(new Map()),
-    input.redPlayers ? getPlayerMastery(input.redPlayers, weights) : Promise.resolve(new Map()),
+    getChampionSynergies(2, weights),
+    getLaneMatchups(1, weights),
+    bluePlayers ? getPlayerMastery(bluePlayers, weights) : Promise.resolve(new Map()),
+    redPlayers ? getPlayerMastery(redPlayers, weights) : Promise.resolve(new Map()),
   ]);
 
   for (const [, syn] of synergies) {
@@ -582,33 +690,45 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
     });
     const championTier = champData.reduce((s, c) => s + c.winRate, 0) / champData.length;
 
-    // Role-pair weighted synergy: top+jng, jng+mid, bot+sup get 1.5× weight
+    // Role-pair weighted synergy with sample confidence
     const synergyPairs: SynergyPair[] = [];
     let weightedLiftSum = 0;
-    let totalRoleWeight = 0;
+    let totalSynWeight = 0;
     for (let i = 0; i < champKeys.length; i++) {
       for (let j = i + 1; j < champKeys.length; j++) {
         const key = [champKeys[i], champKeys[j]].sort().join('|');
         const syn = synergies.get(key);
         if (syn) {
           const rw = rolePairWeight(positions[i], positions[j]);
+          const conf = sampleConfidence(syn.games, N_REF_SYNERGY);
           synergyPairs.push({ ...syn, roleWeight: rw });
-          weightedLiftSum += syn.lift * rw;
-          totalRoleWeight += rw;
+          weightedLiftSum += syn.lift * rw * conf;
+          totalSynWeight += rw * conf;
         }
       }
     }
-    const synergyScore = totalRoleWeight > 0
-      ? weightedLiftSum / totalRoleWeight : 0;
+    const synergyScore = totalSynWeight > 0
+      ? weightedLiftSum / totalSynWeight : 0;
 
+    // Matchups: for each of our 5 slots, consider lane (same-position) and cross
+    // opponents, weighted by W_LANE / W_CROSS and sample confidence.
     const matchupList: MatchupStat[] = [];
+    let muWeightedSum = 0;
+    let muWeightTotal = 0;
     for (let i = 0; i < champKeys.length; i++) {
-      const key = `${champKeys[i]}|${oppKeys[i]}|${positions[i]}`;
-      const mu = matchups.get(key);
-      if (mu) matchupList.push(mu);
+      for (let j = 0; j < oppKeys.length; j++) {
+        const key = `${champKeys[i]}|${oppKeys[j]}|${positions[i]}`;
+        const mu = matchups.get(key);
+        if (!mu) continue;
+        matchupList.push(mu);
+        const posWeight = i === j ? W_LANE : W_CROSS;
+        const conf = sampleConfidence(mu.games, N_REF_MATCHUP);
+        muWeightedSum += mu.adjustedAdvantage * posWeight * conf;
+        muWeightTotal += posWeight * conf;
+      }
     }
-    const matchupScore = matchupList.length > 0
-      ? matchupList.reduce((s, m) => s + m.adjustedAdvantage, 0) / matchupList.length : 0;
+    const matchupScore = muWeightTotal > 0
+      ? muWeightedSum / muWeightTotal : 0;
 
     const masteryList: PlayerChampionMastery[] = [];
     if (players) {
@@ -621,7 +741,7 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
         const globalWR = champWRs.get(champKeys[i])?.winRate ?? 0.5;
 
         if (champMastery) {
-          champMastery.wrDelta = champMastery.winRate - globalWR;
+          // wrDelta already computed in getPlayerMastery (vs player's own avg WR)
           masteryList.push(champMastery);
         } else {
           masteryList.push({
@@ -641,10 +761,19 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
         }
       }
     }
-    // Blend wrDelta (player's WR advantage on champ vs global) with comfort coefficient
-    // comfortCoeff 1.0 = best champ → +0.05 bonus; 0.5 = mediocre → neutral; 0 = worst → -0.05 penalty
-    const masteryScore = masteryList.length > 0
-      ? masteryList.reduce((s, m) => s + m.wrDelta + (m.comfortCoeff - 0.5) * 0.1, 0) / masteryList.length : 0;
+    // Blend wrDelta + comfort, weighted by sample reliability so low-game picks count less.
+    let masteryScore = 0;
+    if (masteryList.length > 0) {
+      let wSum = 0;
+      let wTotal = 0;
+      for (const m of masteryList) {
+        const rel = sampleConfidence(m.games, G_MASTERY_FULL);
+        const contrib = m.wrDelta + (m.comfortCoeff - 0.5) * 0.1;
+        wSum += contrib * rel;
+        wTotal += rel;
+      }
+      masteryScore = wTotal > 0 ? wSum / wTotal : 0;
+    }
 
     const raw = championTier * mix.championTier
       + (0.5 + synergyScore) * mix.synergy
@@ -662,9 +791,9 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
     };
   }
 
-  const blue = scoreSide(input.blueChamps, input.redChamps, input.bluePlayers, blueMastery, scoreMix);
+  const blue = scoreSide(input.blueChamps, input.redChamps, bluePlayers, blueMastery, scoreMix);
   blue.teamSide = 'Blue';
-  const red = scoreSide(input.redChamps, input.blueChamps, input.redPlayers, redMastery, scoreMix);
+  const red = scoreSide(input.redChamps, input.blueChamps, redPlayers, redMastery, scoreMix);
   red.teamSide = 'Red';
 
   const scoreDiff = blue.totalScore - red.totalScore;
@@ -714,10 +843,10 @@ export async function getChampionSynergyList(champion: string, limit: number = 2
 }
 
 export async function getChampionMatchupList(champion: string, position: string, limit: number = 20): Promise<MatchupStat[]> {
-  const matchups = await getLaneMatchups(3);
+  const matchups = await getLaneMatchups(1);
   const key = champion.toLowerCase();
   return [...matchups.values()]
-    .filter((m) => m.champion === key && m.position === position)
+    .filter((m) => m.champion === key && m.position === position && m.kind === 'lane')
     .sort((a, b) => b.winRate - a.winRate)
     .slice(0, limit);
 }

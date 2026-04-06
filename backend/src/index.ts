@@ -22,6 +22,7 @@ import { lolPandascoreRouter } from './api/routes/lol-pandascore';
 import { lolGolggRouter } from './api/routes/lol-golgg';
 import { btcStrategyRouter } from './api/routes/btc-strategy';
 import { lolDraftRouter } from './api/routes/lol-draft-analysis';
+import { lolLiveRouter } from './api/routes/lol-live-predictor';
 import { setupWebSocket } from './api/websocket';
 import { startCron } from './services/cron-scheduler';
 import { startActivityFeedPoller } from './services/activity-feed';
@@ -74,6 +75,7 @@ app.use('/api/lol', lolPandascoreRouter);
 app.use('/api/lol', lolGolggRouter);
 app.use('/api/btc-strategy', btcStrategyRouter);
 app.use('/api', lolDraftRouter);
+app.use('/api', lolLiveRouter);
 
 // Health check
 app.get('/health', (req, res) => {

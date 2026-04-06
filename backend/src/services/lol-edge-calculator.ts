@@ -1,7 +1,7 @@
-import { getWinProbability, computeTeamRatings } from './lol-elo';
-import { getDraftAdjustment, DraftResult } from './lol-draft';
+import { predictMapComposite, CompositePrediction, DraftPick } from './lol-model';
 import { runMonteCarlo, MCResult, SeriesFormat } from './lol-montecarlo';
 import { scanLoLMarkets, LoLMarket } from './lol-market-scanner';
+import { getCompositeTeamRatings } from './lol-model';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -9,8 +9,6 @@ export interface EdgeResult {
   market: LoLMarket;
   teamA: string;
   teamB: string;
-  eloA: number;
-  eloB: number;
   pModel: number;
   pMarket: number;
   edge: number;
@@ -19,27 +17,23 @@ export interface EdgeResult {
   kellyStake: number;
   simulation: MCResult;
   draftApplied: boolean;
-  draft?: DraftResult;
 }
 
 export interface PredictionResult {
   teamA: string;
   teamB: string;
   format: SeriesFormat;
-  eloA: number;
-  eloB: number;
   pMap: number;
   pModel: number;
   simulation: MCResult;
   draftApplied: boolean;
-  draft?: DraftResult;
+  composite: CompositePrediction;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function kellyFraction(edge: number, pModel: number): number {
   if (edge <= 0 || pModel <= 0 || pModel >= 1) return 0;
-  // Fractional Kelly (0.25x) for conservative sizing
   const fullKelly = edge / (1 - pModel);
   return Math.round(Math.max(0, fullKelly * 0.25) * 10000) / 10000;
 }
@@ -50,10 +44,6 @@ function confidence(edge: number, volume: number): 'high' | 'medium' | 'low' {
   return 'low';
 }
 
-/**
- * Fuzzy match a market team name against our Elo DB.
- * Handles cases like "Bilibili Gaming" in Polymarket vs "BLG" in gol.gg.
- */
 const TEAM_ALIASES: Record<string, string[]> = {
   'BLG': ['Bilibili Gaming', 'BLG', 'Bilibili'],
   'Gen.G': ['Gen.G', 'GenG', 'Gen.G Esports'],
@@ -72,28 +62,25 @@ const TEAM_ALIASES: Record<string, string[]> = {
 };
 
 async function resolveTeamName(marketName: string): Promise<string | null> {
-  const ratings = await computeTeamRatings();
+  const ratings = await getCompositeTeamRatings();
+  const teamNames = new Set(ratings.map(r => r.team));
   const lower = marketName.toLowerCase().trim();
 
-  // Direct match
-  if (ratings.has(marketName)) return marketName;
+  if (teamNames.has(marketName)) return marketName;
 
-  // Case-insensitive match
-  for (const [team] of ratings) {
-    if (team.toLowerCase() === lower) return team;
+  for (const t of teamNames) {
+    if (t.toLowerCase() === lower) return t;
   }
 
-  // Alias match
   for (const [canonical, aliases] of Object.entries(TEAM_ALIASES)) {
-    if (aliases.some((a) => a.toLowerCase() === lower)) {
-      if (ratings.has(canonical)) return canonical;
+    if (aliases.some(a => a.toLowerCase() === lower)) {
+      if (teamNames.has(canonical)) return canonical;
     }
   }
 
-  // Substring match (last resort)
-  for (const [team] of ratings) {
-    if (team.toLowerCase().includes(lower) || lower.includes(team.toLowerCase())) {
-      return team;
+  for (const t of teamNames) {
+    if (t.toLowerCase().includes(lower) || lower.includes(t.toLowerCase())) {
+      return t;
     }
   }
 
@@ -107,34 +94,33 @@ export async function predictMatch(
   teamB: string,
   format: SeriesFormat = 'BO3',
   nSims: number = 3000,
-  blueDraft?: string[],
-  redDraft?: string[],
+  draftA?: DraftPick[],
+  draftB?: DraftPick[],
+  playersA?: string[],
+  playersB?: string[],
+  seasons?: string[],
 ): Promise<PredictionResult> {
-  const { p_a, eloA, eloB } = await getWinProbability(teamA, teamB);
+  const composite = await predictMapComposite({
+    teamA,
+    teamB,
+    draftA,
+    draftB,
+    playersA,
+    playersB,
+    seasons,
+  });
 
-  let pMap = p_a;
-  let draftApplied = false;
-  let draft: DraftResult | undefined;
-
-  if (blueDraft?.length === 5 && redDraft?.length === 5) {
-    draft = await getDraftAdjustment(blueDraft, redDraft);
-    pMap = Math.max(0.05, Math.min(0.95, pMap + draft.adjustment));
-    draftApplied = true;
-  }
-
-  const simulation = runMonteCarlo(teamA, teamB, pMap, format, nSims);
+  const simulation = runMonteCarlo(teamA, teamB, composite.pMap, format, nSims);
 
   return {
     teamA,
     teamB,
     format,
-    eloA,
-    eloB,
-    pMap: Math.round(pMap * 10000) / 10000,
+    pMap: composite.pMap,
     pModel: simulation.pSeriesWin,
     simulation,
-    draftApplied,
-    draft,
+    draftApplied: Boolean(draftA?.length === 5 && draftB?.length === 5),
+    composite,
   };
 }
 
@@ -163,8 +149,6 @@ export async function scanEdges(nSims: number = 3000): Promise<EdgeResult[]> {
       market,
       teamA,
       teamB,
-      eloA: prediction.eloA,
-      eloB: prediction.eloB,
       pModel: prediction.pModel,
       pMarket,
       edge: Math.round(edge * 10000) / 10000,

@@ -717,6 +717,50 @@ model OEGame {
   redBan5       String?
   // Blue-side first pick
   blueFirstPick Boolean  @default(false)
+
+  // ─── Objectives (from blue-side team row) ─────────────────────
+  blueFirstDragon  Int?
+  blueDragons      Int?
+  blueInfernals    Int?
+  blueMountains    Int?
+  blueClouds       Int?
+  blueOceans       Int?
+  blueChemtechs    Int?
+  blueHextechs     Int?
+  blueElders       Int?
+  blueFirstHerald  Int?
+  blueHeralds      Int?
+  blueVoidGrubs    Int?
+  blueFirstBaron   Int?
+  blueBarons       Int?
+  blueAtakhans     Int?
+  blueFirstTower   Int?
+  blueTowers       Int?
+  blueTurretPlates Int?
+  blueInhibitors   Int?
+
+  redDragons       Int?
+  redInfernals     Int?
+  redMountains     Int?
+  redClouds        Int?
+  redOceans        Int?
+  redChemtechs     Int?
+  redHextechs      Int?
+  redElders        Int?
+  redHeralds       Int?
+  redVoidGrubs     Int?
+  redBarons        Int?
+  redAtakhans      Int?
+  redTowers        Int?
+  redTurretPlates  Int?
+  redInhibitors    Int?
+
+  // ─── Team-level gold diffs at minute marks ────────────────────
+  blueGoldDiffAt10 Float?
+  blueGoldDiffAt15 Float?
+  blueGoldDiffAt20 Float?
+  blueGoldDiffAt25 Float?
+
   createdAt     DateTime @default(now())
 
   players       OEPlayerGame[]
@@ -725,6 +769,7 @@ model OEGame {
   @@index([league])
   @@index([date])
   @@index([blueTeam, redTeam])
+  @@index([year])
   @@map("oe_games")
 }
 

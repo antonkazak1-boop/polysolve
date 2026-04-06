@@ -7,6 +7,8 @@ import {
   getChampionWinRates,
   getPlayerMastery,
   getDataSummary,
+  getOeChampionsForPicker,
+  searchOePlayersForPicker,
   type DraftWeightsConfig,
   type DraftScoreMixInput,
 } from '../../services/draft-analysis';
@@ -65,6 +67,28 @@ export const lolDraftRouter = Router();
 lolDraftRouter.get('/lol/draft/summary', async (_req: Request, res: Response) => {
   const summary = await getDataSummary();
   res.json(summary);
+});
+
+/** All OE champions (alphabetical) for draft page combobox */
+lolDraftRouter.get('/lol/draft/picker/champions', async (_req: Request, res: Response) => {
+  try {
+    const champions = await getOeChampionsForPicker();
+    res.json({ count: champions.length, champions });
+  } catch (e: unknown) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+/** Search OE player names; q= substring, case-insensitive */
+lolDraftRouter.get('/lol/draft/picker/players', async (req: Request, res: Response) => {
+  try {
+    const q = String(req.query.q ?? '');
+    const limit = Math.min(Number(req.query.limit) || 25, 50);
+    const players = await searchOePlayersForPicker(q, limit);
+    res.json({ count: players.length, players });
+  } catch (e: unknown) {
+    res.status(500).json({ error: (e as Error).message });
+  }
 });
 
 // Top champions by WR on recent patches

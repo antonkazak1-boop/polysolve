@@ -36,6 +36,8 @@ interface MatchupStat {
   champion: string;
   opponent: string;
   position: string;
+  opponentPosition?: string;
+  kind?: 'lane' | 'cross';
   games: number;
   wins: number;
   winRate: number;
@@ -143,6 +145,29 @@ interface Summary {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const POSITIONS = ['top', 'jng', 'mid', 'bot', 'sup'] as const;
+const WINS_NEEDED_UI: Record<string, number> = { BO1: 1, BO3: 2, BO5: 3 };
+const MAX_MAPS_UI: Record<string, number> = { BO1: 1, BO3: 3, BO5: 5 };
+
+interface MapDraft {
+  blueChamps: string[];
+  redChamps: string[];
+  bluePlayers: string[];
+  redPlayers: string[];
+  /** null = not yet played, 'blue' or 'red' = winner of this map */
+  winner: 'blue' | 'red' | null;
+  rawResult: DraftResult | null;
+}
+
+function emptyMapDraft(prevPlayers?: MapDraft): MapDraft {
+  return {
+    blueChamps: ['', '', '', '', ''],
+    redChamps: ['', '', '', '', ''],
+    bluePlayers: prevPlayers ? [...prevPlayers.bluePlayers] : ['', '', '', '', ''],
+    redPlayers: prevPlayers ? [...prevPlayers.redPlayers] : ['', '', '', '', ''],
+    winner: null,
+    rawResult: null,
+  };
+}
 const POS_LABELS: Record<string, string> = { top: 'TOP', jng: 'JNG', mid: 'MID', bot: 'ADC', sup: 'SUP' };
 const POS_COLORS: Record<string, string> = {
   top: 'text-red-400 bg-red-500/10 border-red-500/20',
@@ -437,7 +462,7 @@ function ScoreMixForm({
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {num('championTier', 'Champion tier')}
         {num('synergy', 'Synergy')}
-        {num('matchup', 'Lane matchups')}
+        {num('matchup', 'Matchups (lane + comp)')}
         {num('mastery', 'Player mastery')}
       </div>
       <div className="text-[10px] text-cyan-600/90 font-mono">
@@ -548,25 +573,166 @@ function TeamStrengthForm({
   );
 }
 
-function ChampInput({ pos, value, onChange, player, onPlayerChange, side }:
-  { pos: string; value: string; onChange: (v: string) => void; player: string; onPlayerChange: (v: string) => void; side: 'blue' | 'red' }) {
-  const borderColor = side === 'blue' ? 'border-blue-500/30 focus:border-blue-400' : 'border-red-500/30 focus:border-red-400';
+interface PickerChampionRow {
+  champion: string;
+  games: number;
+}
+
+/** OE player search — case-insensitive on server; min 2 chars. */
+function PlayerDraftCombo({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const [results, setResults] = useState<{ name: string; games: number }[]>([]);
+
+  const fetchPlayers = useCallback(async (q: string) => {
+    const t = q.trim();
+    if (t.length < 2) {
+      setResults([]);
+      return;
+    }
+    try {
+      const { data } = await api.get<{ players: { name: string; games: number }[] }>(
+        '/lol/draft/picker/players',
+        { params: { q: t, limit: 25 } },
+      );
+      setResults(data.players ?? []);
+    } catch {
+      setResults([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const q = search.trim();
+    if (q.length < 2) {
+      setResults([]);
+      return;
+    }
+    const h = window.setTimeout(() => void fetchPlayers(q), 200);
+    return () => window.clearTimeout(h);
+  }, [search, open, fetchPlayers]);
+
   return (
-    <div className="flex items-center gap-2">
-      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border w-8 text-center ${POS_COLORS[pos]}`}>
+    <div className="relative min-w-[9rem] flex-1 max-w-[11rem]">
+      <input
+        value={value || search}
+        onChange={(e) => {
+          const v = e.target.value;
+          setSearch(v);
+          if (value) onChange('');
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => window.setTimeout(() => setOpen(false), 200)}
+        placeholder={placeholder}
+        className="w-full bg-gray-950 border border-gray-700 rounded-lg px-2.5 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-gray-500"
+      />
+      {open && results.length > 0 && (
+        <div className="absolute z-50 top-full left-0 right-0 mt-0.5 bg-gray-900 border border-gray-700 rounded-lg max-h-48 overflow-y-auto shadow-xl">
+          {results.map((p) => (
+            <button
+              key={p.name}
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                onChange(p.name);
+                setSearch('');
+                setOpen(false);
+              }}
+              className="w-full text-left px-2.5 py-1.5 text-xs hover:bg-gray-800 text-gray-200 border-b border-gray-800/80 last:border-0"
+            >
+              <span className="text-white">{p.name}</span>
+              <span className="text-gray-500 ml-2">{p.games} games</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChampInput({
+  pos,
+  value,
+  onChange,
+  player,
+  onPlayerChange,
+  side,
+  championOptions,
+}: {
+  pos: string;
+  value: string;
+  onChange: (v: string) => void;
+  player: string;
+  onPlayerChange: (v: string) => void;
+  side: 'blue' | 'red';
+  championOptions: PickerChampionRow[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const borderColor = side === 'blue' ? 'border-blue-500/30 focus:border-blue-400' : 'border-red-500/30 focus:border-red-400';
+
+  const filtered = useMemo(() => {
+    if (!championOptions.length) return [];
+    const q = search.toLowerCase().trim();
+    if (q) {
+      return championOptions.filter((c) => c.champion.toLowerCase().includes(q)).slice(0, 50);
+    }
+    return championOptions.slice(0, 24);
+  }, [championOptions, search]);
+
+  return (
+    <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border w-8 text-center shrink-0 ${POS_COLORS[pos]}`}>
         {POS_LABELS[pos]}
       </span>
-      <input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="Champion"
-        className={`bg-gray-950 border rounded-lg px-2.5 py-1.5 text-sm text-white w-32 focus:outline-none ${borderColor}`}
-      />
-      <input
+      <div className="relative min-w-[8.5rem] flex-1 max-w-[11rem]">
+        <input
+          value={value || search}
+          onChange={(e) => {
+            const v = e.target.value;
+            setSearch(v);
+            if (value) onChange('');
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => window.setTimeout(() => setOpen(false), 200)}
+          placeholder="Champion…"
+          className={`w-full bg-gray-950 border rounded-lg px-2.5 py-1.5 text-sm text-white focus:outline-none ${borderColor}`}
+        />
+        {open && filtered.length > 0 && (
+          <div className="absolute z-50 top-full left-0 right-0 mt-0.5 bg-gray-900 border border-gray-700 rounded-lg max-h-52 overflow-y-auto shadow-xl">
+            {filtered.map((c) => (
+              <button
+                key={c.champion}
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  onChange(c.champion);
+                  setSearch('');
+                  setOpen(false);
+                }}
+                className="w-full text-left px-2.5 py-1.5 text-xs hover:bg-gray-800 text-gray-200 border-b border-gray-800/80 last:border-0"
+              >
+                <span className="text-white">{c.champion}</span>
+                <span className="text-gray-500 ml-2">{c.games.toLocaleString()}p</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <PlayerDraftCombo
         value={player}
-        onChange={(e) => onPlayerChange(e.target.value)}
-        placeholder="Player (optional)"
-        className={`bg-gray-950 border border-gray-700 rounded-lg px-2.5 py-1.5 text-sm text-gray-300 w-36 focus:outline-none focus:border-gray-500`}
+        onChange={onPlayerChange}
+        placeholder="Player…"
       />
     </div>
   );
@@ -610,38 +776,53 @@ function ChampTable({ champs, side }: { champs: ChampionWR[]; side: 'blue' | 're
   );
 }
 
+function kindBadge(kind: 'lane' | 'cross' | undefined) {
+  if (kind === 'lane') return <span className="text-[9px] px-1 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">Lane</span>;
+  if (kind === 'cross') return <span className="text-[9px] px-1 py-0.5 rounded bg-gray-500/20 text-gray-400 border border-gray-600/30">Cross</span>;
+  return null;
+}
+
 function MatchupTable({ matchups }: { matchups: MatchupStat[] }) {
   if (!matchups.length) return <div className="text-xs text-gray-600 px-3 py-2">No matchup data for these picks</div>;
+  const lane = matchups.filter((m) => m.kind === 'lane');
+  const cross = matchups.filter((m) => m.kind === 'cross');
+  const sorted = [...lane.sort((a, b) => b.adjustedAdvantage - a.adjustedAdvantage), ...cross.sort((a, b) => b.adjustedAdvantage - a.adjustedAdvantage)];
+
   return (
     <table className="w-full text-xs">
       <thead>
         <tr className="text-left border-b border-gray-700/50 text-gray-500">
-          <th className="px-3 py-1.5 font-medium">Lane</th>
+          <th className="px-3 py-1.5 font-medium">Pos</th>
           <th className="px-3 py-1.5 font-medium">Champ</th>
           <th className="px-3 py-1.5 font-medium">vs</th>
+          <th className="px-2 py-1.5 font-medium text-center">Kind</th>
           <th className="px-3 py-1.5 font-medium text-right">Games</th>
           <th className="px-3 py-1.5 font-medium text-right">WR</th>
           <th className="px-3 py-1.5 font-medium text-right">GD@15</th>
-          <th className="px-3 py-1.5 font-medium text-right">Type</th>
           <th className="px-3 py-1.5 font-medium text-right">Adj</th>
         </tr>
       </thead>
       <tbody>
-        {matchups.map((m) => (
-          <tr key={`${m.champion}-${m.opponent}-${m.position}`} className="border-b border-gray-800/40 hover:bg-white/[0.02]">
+        {sorted.map((m) => (
+          <tr key={`${m.champion}-${m.opponent}-${m.position}-${m.opponentPosition ?? ''}`} className={`border-b border-gray-800/40 hover:bg-white/[0.02] ${m.kind === 'cross' ? 'opacity-70' : ''}`}>
             <td className="px-3 py-1.5">
               <span className={`text-[10px] font-bold px-1 py-0.5 rounded border ${POS_COLORS[m.position]}`}>
                 {POS_LABELS[m.position]}
               </span>
             </td>
             <td className="px-3 py-1.5 font-medium text-white capitalize">{m.champion}</td>
-            <td className="px-3 py-1.5 text-gray-400 capitalize">{m.opponent}</td>
+            <td className="px-3 py-1.5 text-gray-400 capitalize">
+              {m.opponent}
+              {m.kind === 'cross' && m.opponentPosition && (
+                <span className="text-[9px] text-gray-600 ml-1">({POS_LABELS[m.opponentPosition] ?? m.opponentPosition})</span>
+              )}
+            </td>
+            <td className="px-2 py-1.5 text-center">{kindBadge(m.kind)}{m.kind === 'lane' && scalingBadge(m.scalingTag)}</td>
             <td className="px-3 py-1.5 text-right text-gray-400">{m.games}</td>
             <td className={`px-3 py-1.5 text-right font-mono ${wrColor(m.winRate)}`}>{pct(m.winRate)}</td>
-            <td className={`px-3 py-1.5 text-right font-mono ${m.avgGD15 >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {m.avgGD15 >= 0 ? '+' : ''}{Math.round(m.avgGD15)}
+            <td className={`px-3 py-1.5 text-right font-mono ${m.kind === 'lane' ? (m.avgGD15 >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-600'}`}>
+              {m.kind === 'lane' ? `${m.avgGD15 >= 0 ? '+' : ''}${Math.round(m.avgGD15)}` : '—'}
             </td>
-            <td className="px-3 py-1.5 text-right">{scalingBadge(m.scalingTag)}</td>
             <td className={`px-3 py-1.5 text-right font-mono ${deltaColor(m.adjustedAdvantage)}`}>
               {signedPct(m.adjustedAdvantage)}
             </td>
@@ -704,7 +885,7 @@ function MasteryTable({ mastery }: { mastery: PlayerMastery[] }) {
           <th className="px-3 py-1.5 font-medium text-right">WR</th>
           <th className="px-3 py-1.5 font-medium text-right">KDA</th>
           <th className="px-3 py-1.5 font-medium text-right" title="1.0 = player's best champion, lower = less comfortable">Comfort</th>
-          <th className="px-3 py-1.5 font-medium text-right">vs Global WR</th>
+          <th className="px-3 py-1.5 font-medium text-right" title="WR on this champion vs player's own average WR">vs Own WR</th>
         </tr>
       </thead>
       <tbody>
@@ -737,31 +918,72 @@ function MasteryTable({ mastery }: { mastery: PlayerMastery[] }) {
 // ─── Main page ───────────────────────────────────────────────────────────────
 
 export default function DraftAnalyzerPage() {
-  const [blueChamps, setBlueChamps] = useState(['', '', '', '', '']);
-  const [redChamps, setRedChamps] = useState(['', '', '', '', '']);
-  const [bluePlayers, setBluePlayers] = useState(['', '', '', '', '']);
-  const [redPlayers, setRedPlayers] = useState(['', '', '', '', '']);
+  // ── Series state ──
+  const [seriesFormat, setSeriesFormat] = useState<'BO1' | 'BO3' | 'BO5'>('BO3');
+  const [maps, setMaps] = useState<MapDraft[]>([emptyMapDraft()]);
+  const [activeMapIdx, setActiveMapIdx] = useState(0);
+
   const [weights, setWeights] = useState<DraftWeightsConfig>({ ...FALLBACK_WEIGHTS });
   const [scoreMix, setScoreMix] = useState<DraftScoreMixInput>({ ...FALLBACK_SCORE_MIX });
   const [teamStrength, setTeamStrength] = useState<TeamStrengthConfig>({ priorBlue: 0.5, draftWeight: 0.4 });
   const [settingsSynced, setSettingsSynced] = useState(false);
-  /** Raw server response — contains per-pillar scores before mix is applied. */
-  const [rawResult, setRawResult] = useState<DraftResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [summary, setSummary] = useState<Summary | null>(null);
   const [activeTab, setActiveTab] = useState<'overview' | 'matchups' | 'synergy' | 'mastery'>('overview');
-  /** Cancel in-flight analyze requests when a new one starts. */
   const abortRef = useRef<AbortController | null>(null);
 
+  const [pickerChampions, setPickerChampions] = useState<PickerChampionRow[]>([]);
+
   // Monte Carlo state
-  const [mcFormat, setMcFormat] = useState<'BO1' | 'BO3' | 'BO5'>('BO3');
   const [mcNSims, setMcNSims] = useState(120_000);
   const [mcResult, setMcResult] = useState<MCResult | null>(null);
   const [mcLoading, setMcLoading] = useState(false);
 
+  // ── Derived: current map, used champs, series score ──
+  const curMap = maps[activeMapIdx] ?? maps[0];
+  const blueChamps = curMap.blueChamps;
+  const redChamps = curMap.redChamps;
+  const bluePlayers = curMap.bluePlayers;
+  const redPlayers = curMap.redPlayers;
+  const rawResult = curMap.rawResult;
+
+  const usedChamps = useMemo(() => {
+    const set = new Set<string>();
+    for (let i = 0; i < activeMapIdx; i++) {
+      const m = maps[i];
+      if (m.winner) {
+        for (const c of m.blueChamps) if (c) set.add(c.toLowerCase());
+        for (const c of m.redChamps) if (c) set.add(c.toLowerCase());
+      }
+    }
+    return set;
+  }, [maps, activeMapIdx]);
+
+  const availableChampions = useMemo(() => {
+    if (usedChamps.size === 0) return pickerChampions;
+    return pickerChampions.filter((c) => !usedChamps.has(c.champion.toLowerCase()));
+  }, [pickerChampions, usedChamps]);
+
+  const seriesScore = useMemo(() => {
+    let blue = 0;
+    let red = 0;
+    for (const m of maps) {
+      if (m.winner === 'blue') blue++;
+      else if (m.winner === 'red') red++;
+    }
+    return { blue, red };
+  }, [maps]);
+
   useEffect(() => {
     api.get('/lol/draft/summary').then((r) => setSummary(r.data)).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    void api
+      .get<{ champions: PickerChampionRow[] }>('/lol/draft/picker/champions')
+      .then((r) => setPickerChampions(r.data.champions ?? []))
+      .catch(() => setPickerChampions([]));
   }, []);
 
   useEffect(() => {
@@ -821,15 +1043,52 @@ export default function DraftAnalyzerPage() {
     };
   }, [rawResult, scoreMix, teamStrength]);
 
+  // Save draft data to localStorage for Live Predictor
+  useEffect(() => {
+    if (!result) return;
+    try {
+      localStorage.setItem('lol-draft-live', JSON.stringify({
+        blueChamps, redChamps, bluePlayers, redPlayers,
+        pMap: result.finalWinProbability,
+      }));
+    } catch { /* ignore */ }
+  }, [result, blueChamps, redChamps, bluePlayers, redPlayers]);
+
+  const updateMap = useCallback((idx: number, patch: Partial<MapDraft>) => {
+    setMaps((prev) => {
+      const next = [...prev];
+      next[idx] = { ...next[idx], ...patch };
+      return next;
+    });
+  }, []);
+
   const updateChamp = (side: 'blue' | 'red', idx: number, val: string) => {
-    const setter = side === 'blue' ? setBlueChamps : setRedChamps;
-    setter((prev) => { const n = [...prev]; n[idx] = val; return n; });
+    updateMap(activeMapIdx, {
+      [side === 'blue' ? 'blueChamps' : 'redChamps']:
+        (side === 'blue' ? blueChamps : redChamps).map((c, i) => (i === idx ? val : c)),
+    });
   };
 
   const updatePlayer = (side: 'blue' | 'red', idx: number, val: string) => {
-    const setter = side === 'blue' ? setBluePlayers : setRedPlayers;
-    setter((prev) => { const n = [...prev]; n[idx] = val; return n; });
+    updateMap(activeMapIdx, {
+      [side === 'blue' ? 'bluePlayers' : 'redPlayers']:
+        (side === 'blue' ? bluePlayers : redPlayers).map((c, i) => (i === idx ? val : c)),
+    });
   };
+
+  const swapSides = useCallback(() => {
+    updateMap(activeMapIdx, {
+      blueChamps: [...redChamps],
+      redChamps: [...blueChamps],
+      bluePlayers: [...redPlayers],
+      redPlayers: [...bluePlayers],
+      rawResult: rawResult ? { ...rawResult, blue: rawResult.red, red: rawResult.blue } : null,
+    });
+    setTeamStrength((ts) => ({
+      ...ts,
+      priorBlue: Math.max(0.01, Math.min(0.99, 1 - ts.priorBlue)),
+    }));
+  }, [activeMapIdx, blueChamps, redChamps, bluePlayers, redPlayers, rawResult, updateMap]);
 
   const analyze = useCallback(async () => {
     const bc = blueChamps.map((c) => c.trim()).filter(Boolean);
@@ -839,7 +1098,6 @@ export default function DraftAnalyzerPage() {
       return;
     }
     setError('');
-    // Cancel any previous in-flight request before starting a new one
     const prevCtrl = abortRef.current;
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -849,7 +1107,6 @@ export default function DraftAnalyzerPage() {
     try {
       const bp = bluePlayers.map((p) => p.trim());
       const rp = redPlayers.map((p) => p.trim());
-      // Always send default scoreMix — actual mix is applied client-side in useMemo
       const body: Record<string, unknown> = {
         blueChamps: bc, redChamps: rc, weights,
         scoreMix: FALLBACK_SCORE_MIX,
@@ -858,31 +1115,50 @@ export default function DraftAnalyzerPage() {
       if (rp.some(Boolean)) body.redPlayers = rp;
       const { data } = await api.post('/lol/draft/analyze', body, {
         signal: ctrl.signal,
-        timeout: 120_000, // 2 min — analysis can be slow with heavy weights
+        timeout: 120_000,
       });
       if (!ctrl.signal.aborted) {
-        setRawResult(data);
+        updateMap(activeMapIdx, { rawResult: data });
         setActiveTab('overview');
       }
     } catch (e: any) {
-      // Swallow abort/cancel — a newer request is already in flight
       const isCanceled = e?.code === 'ERR_CANCELED' || e?.name === 'AbortError' || e?.name === 'CanceledError';
       if (!isCanceled) {
         const msg = e?.response?.data?.error || e?.message || 'Analysis failed';
         setError(msg);
       }
     } finally {
-      // Only clear loading if this request is still the active one
       if (abortRef.current === ctrl) setLoading(false);
     }
-  }, [blueChamps, redChamps, bluePlayers, redPlayers, weights]);
+  }, [blueChamps, redChamps, bluePlayers, redPlayers, weights, activeMapIdx, updateMap]);
 
   const loadPreset = (p: DraftPreset) => {
-    setBlueChamps([...p.blueChamps]);
-    setRedChamps([...p.redChamps]);
-    setBluePlayers([...p.bluePlayers]);
-    setRedPlayers([...p.redPlayers]);
+    updateMap(activeMapIdx, {
+      blueChamps: [...p.blueChamps],
+      redChamps: [...p.redChamps],
+      bluePlayers: [...p.bluePlayers],
+      redPlayers: [...p.redPlayers],
+      rawResult: null,
+    });
   };
+
+  const addNextMap = useCallback(() => {
+    const maxMaps = MAX_MAPS_UI[seriesFormat] ?? 1;
+    if (maps.length >= maxMaps) return;
+    const prev = maps[maps.length - 1];
+    setMaps((old) => [...old, emptyMapDraft(prev)]);
+    setActiveMapIdx(maps.length);
+  }, [maps, seriesFormat]);
+
+  const setMapWinner = useCallback((idx: number, winner: 'blue' | 'red' | null) => {
+    updateMap(idx, { winner });
+  }, [updateMap]);
+
+  const resetSeries = useCallback(() => {
+    setMaps([emptyMapDraft()]);
+    setActiveMapIdx(0);
+    setMcResult(null);
+  }, []);
 
   const resetWeights = () => {
     const d = summary?.defaultWeights ?? FALLBACK_WEIGHTS;
@@ -899,22 +1175,22 @@ export default function DraftAnalyzerPage() {
     setMcLoading(true);
     setMcResult(null);
     try {
-      // Map 1: draft-adjusted final probability
       const pMap = Math.max(0.01, Math.min(0.99, result.finalWinProbability));
-      // Maps 2+: prior only (draft unknown for subsequent maps)
       const pMapRest = Math.max(0.01, Math.min(0.99, teamStrength.priorBlue));
       const { data } = await api.post<MCResult>('/lol/golgg/predictor/simulate', {
         teamA: blueChamps.filter(Boolean)[0] || 'Blue',
         teamB: redChamps.filter(Boolean)[0] || 'Red',
         pMap,
         pMapRest,
-        format: mcFormat,
+        format: seriesFormat,
         nSims: mcNSims,
+        startA: seriesScore.blue,
+        startB: seriesScore.red,
       });
       setMcResult(data);
     } catch { /* empty */ }
     finally { setMcLoading(false); }
-  }, [result, mcFormat, mcNSims, blueChamps, redChamps]);
+  }, [result, seriesFormat, mcNSims, seriesScore, blueChamps, redChamps, teamStrength]);
 
   return (
     <div className="space-y-6 max-w-6xl mx-auto">
@@ -928,9 +1204,14 @@ export default function DraftAnalyzerPage() {
             Analyze pro drafts: champion tier, synergies, lane matchups (with scaling detection), player mastery.
           </p>
         </div>
-        <Link href="/lol" className="text-sm text-gray-400 hover:text-gray-200 border border-gray-700 rounded-lg px-3 py-2">
-          LoL Data
-        </Link>
+        <div className="flex items-center gap-2">
+          <Link href="/lol/live" className="text-sm text-purple-400 hover:text-purple-300 border border-purple-500/30 rounded-lg px-3 py-2 transition-colors">
+            Live Predictor
+          </Link>
+          <Link href="/lol" className="text-sm text-gray-400 hover:text-gray-200 border border-gray-700 rounded-lg px-3 py-2">
+            LoL Data
+          </Link>
+        </div>
       </div>
 
       {/* Summary bar */}
@@ -986,6 +1267,132 @@ export default function DraftAnalyzerPage() {
         </div>
       </div>
 
+      {/* ── Series format & map tabs ───────────────────────────────── */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-medium text-gray-200">Серия</span>
+            <select
+              value={seriesFormat}
+              onChange={(e) => {
+                setSeriesFormat(e.target.value as 'BO1' | 'BO3' | 'BO5');
+                resetSeries();
+              }}
+              className="bg-gray-950 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-white"
+            >
+              <option value="BO1">BO1</option>
+              <option value="BO3">BO3</option>
+              <option value="BO5">BO5</option>
+            </select>
+            {seriesFormat !== 'BO1' && (
+              <span className="text-xs text-gray-500">
+                Счёт: <span className="text-blue-400 font-bold">{seriesScore.blue}</span>
+                <span className="text-gray-600 mx-0.5">:</span>
+                <span className="text-red-400 font-bold">{seriesScore.red}</span>
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={swapSides}
+              className="text-xs px-3 py-1.5 rounded-lg border border-gray-600 text-gray-300 hover:bg-gray-800 transition-colors"
+            >
+              ⇄ Стороны
+            </button>
+            <button
+              type="button"
+              onClick={resetSeries}
+              className="text-xs px-3 py-1.5 rounded-lg border border-gray-600 text-gray-300 hover:bg-gray-800 transition-colors"
+            >
+              Сбросить серию
+            </button>
+          </div>
+        </div>
+
+        {seriesFormat !== 'BO1' && (
+          <div className="flex items-center gap-2">
+            {maps.map((m, i) => {
+              const isActive = i === activeMapIdx;
+              const hasResult = !!m.rawResult;
+              const winnerLabel = m.winner === 'blue' ? 'B' : m.winner === 'red' ? 'R' : '';
+              const winnerColor = m.winner === 'blue' ? 'text-blue-400' : m.winner === 'red' ? 'text-red-400' : '';
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => setActiveMapIdx(i)}
+                  className={`relative px-4 py-2 rounded-lg text-xs font-medium transition-colors border ${
+                    isActive
+                      ? 'bg-violet-600/20 border-violet-500 text-white'
+                      : hasResult
+                        ? 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'
+                        : 'bg-gray-900 border-gray-700 text-gray-500 hover:bg-gray-800'
+                  }`}
+                >
+                  Map {i + 1}
+                  {winnerLabel && (
+                    <span className={`ml-1.5 font-bold ${winnerColor}`}>{winnerLabel}</span>
+                  )}
+                  {hasResult && !m.winner && (
+                    <span className="ml-1 text-yellow-500">●</span>
+                  )}
+                </button>
+              );
+            })}
+            {maps.length < MAX_MAPS_UI[seriesFormat] && (
+              <button
+                type="button"
+                onClick={addNextMap}
+                className="px-3 py-2 rounded-lg text-xs font-medium bg-gray-900 border border-dashed border-gray-600 text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-colors"
+              >
+                + Map {maps.length + 1}
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Used champs from previous maps */}
+        {usedChamps.size > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-[10px] text-gray-500 mr-1">Уже сыграны:</span>
+            {[...usedChamps].sort().map((c) => (
+              <span key={c} className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 capitalize">{c}</span>
+            ))}
+          </div>
+        )}
+
+        {/* Map winner selector for current map (after analysis) */}
+        {curMap.rawResult && seriesFormat !== 'BO1' && (
+          <div className="flex items-center gap-2 pt-1 border-t border-gray-800">
+            <span className="text-xs text-gray-400">Результат Map {activeMapIdx + 1}:</span>
+            {(['blue', 'red'] as const).map((side) => (
+              <button
+                key={side}
+                type="button"
+                onClick={() => setMapWinner(activeMapIdx, curMap.winner === side ? null : side)}
+                className={`px-3 py-1 rounded text-xs font-medium transition-colors border ${
+                  curMap.winner === side
+                    ? side === 'blue' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-red-600 border-red-500 text-white'
+                    : 'bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700'
+                }`}
+              >
+                {side === 'blue' ? 'Blue Win' : 'Red Win'}
+              </button>
+            ))}
+            {curMap.winner && maps.length < MAX_MAPS_UI[seriesFormat] && (
+              <button
+                type="button"
+                onClick={addNextMap}
+                className="px-3 py-1 rounded text-xs font-medium bg-violet-600/20 border border-violet-500/50 text-violet-300 hover:bg-violet-600/30 transition-colors ml-2"
+              >
+                → Перейти к Map {maps.length + 1}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* Draft input */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Blue side */}
@@ -1004,6 +1411,7 @@ export default function DraftAnalyzerPage() {
                 player={bluePlayers[i]}
                 onPlayerChange={(v) => updatePlayer('blue', i, v)}
                 side="blue"
+                championOptions={availableChampions}
               />
             ))}
           </div>
@@ -1025,6 +1433,7 @@ export default function DraftAnalyzerPage() {
                 player={redPlayers[i]}
                 onPlayerChange={(v) => updatePlayer('red', i, v)}
                 side="red"
+                championOptions={availableChampions}
               />
             ))}
           </div>
@@ -1124,7 +1533,7 @@ export default function DraftAnalyzerPage() {
             <div className="space-y-3 mt-4 pt-4 border-t border-gray-800">
               <ScoreBar label="Champion Tier" blue={result.blue.championTier - 0.5} red={result.red.championTier - 0.5} description={result.dataWindows?.championWR ?? 'recent patches'} mixShare={result.scoreMixApplied?.championTier} />
               <ScoreBar label="Synergy" blue={result.blue.synergyScore} red={result.red.synergyScore} description={result.dataWindows?.synergiesMatchups ?? 'all data'} mixShare={result.scoreMixApplied?.synergy} />
-              <ScoreBar label="Lane Matchups" blue={result.blue.matchupScore} red={result.red.matchupScore} description={result.dataWindows?.synergiesMatchups ?? 'all data'} mixShare={result.scoreMixApplied?.matchup} />
+              <ScoreBar label="Matchups (lane + comp)" blue={result.blue.matchupScore} red={result.red.matchupScore} description={result.dataWindows?.synergiesMatchups ?? 'all data'} mixShare={result.scoreMixApplied?.matchup} />
               <ScoreBar label="Player Mastery" blue={result.blue.masteryScore} red={result.red.masteryScore} description={result.dataWindows?.playerMastery ?? 'recent patches'} mixShare={result.scoreMixApplied?.mastery} />
             </div>
           </div>
@@ -1169,14 +1578,14 @@ export default function DraftAnalyzerPage() {
                 <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-gray-800">
                   <div>
                     <div className="px-3 py-2 bg-blue-500/5 border-b border-blue-500/20">
-                      <span className="text-xs font-semibold text-blue-300">Blue Lane Matchups</span>
-                      <span className="text-[10px] text-gray-500 ml-2">SCALING = loses lane but wins game</span>
+                      <span className="text-xs font-semibold text-blue-300">Blue Matchups</span>
+                      <span className="text-[10px] text-gray-500 ml-2">Lane = head-to-head · Cross = vs other roles</span>
                     </div>
                     <MatchupTable matchups={result.blue.components.matchups} />
                   </div>
                   <div>
                     <div className="px-3 py-2 bg-red-500/5 border-b border-red-500/20">
-                      <span className="text-xs font-semibold text-red-300">Red Lane Matchups</span>
+                      <span className="text-xs font-semibold text-red-300">Red Matchups</span>
                     </div>
                     <MatchupTable matchups={result.red.components.matchups} />
                   </div>
@@ -1225,39 +1634,28 @@ export default function DraftAnalyzerPage() {
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <div className="text-sm font-semibold text-white">Monte Carlo Simulation</div>
+                <div className="text-sm font-semibold text-white">Monte Carlo — {seriesFormat}</div>
                 <p className="text-[10px] text-gray-500 mt-0.5">
-                  Runs series simulation using final win probability (prior + draft shift) as per-map win rate.
+                  Симуляция серии с текущего счёта ({seriesScore.blue}-{seriesScore.red}). Следующая карта использует драфт Map {activeMapIdx + 1}, остальные — prior.
                 </p>
               </div>
               <div className="flex items-center gap-2">
-                {/* Format selector */}
-                <select
-                  value={mcFormat}
-                  onChange={(e) => setMcFormat(e.target.value as 'BO1' | 'BO3' | 'BO5')}
-                  className="bg-gray-950 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-white"
-                >
-                  <option value="BO1">BO1</option>
-                  <option value="BO3">BO3</option>
-                  <option value="BO5">BO5</option>
-                </select>
-                {/* nSims selector */}
                 <select
                   value={mcNSims}
                   onChange={(e) => setMcNSims(Number(e.target.value))}
                   className="bg-gray-950 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-white"
                 >
-                  <option value={30000}>30 000 sims</option>
-                  <option value={100_000}>100 000 sims</option>
-                  <option value={120_000}>120 000 sims</option>
-                  <option value={200_000}>200 000 sims (max)</option>
+                  <option value={30000}>30k sims</option>
+                  <option value={100_000}>100k sims</option>
+                  <option value={120_000}>120k sims</option>
+                  <option value={200_000}>200k sims</option>
                 </select>
                 <button
                   onClick={runMC}
                   disabled={mcLoading}
                   className="px-4 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium disabled:opacity-50 whitespace-nowrap"
                 >
-                  {mcLoading ? 'Simulating…' : `Run MC ×${mcNSims.toLocaleString()}`}
+                  {mcLoading ? 'Simulating…' : 'Run MC'}
                 </button>
               </div>
             </div>
@@ -1265,14 +1663,20 @@ export default function DraftAnalyzerPage() {
             {/* pMap info */}
             <div className="text-[11px] text-gray-500 font-mono space-y-0.5">
               <div>
-                <span className="text-gray-400">Map 1</span>{' '}
-                <span className="text-violet-300 font-semibold">{pct(result.finalWinProbability)}</span>
-                <span className="text-gray-700 ml-1">(prior + draft shift)</span>
+                <span className="text-gray-400">Текущий счёт серии:</span>{' '}
+                <span className="text-blue-400 font-bold">{seriesScore.blue}</span>
+                <span className="text-gray-600">:</span>
+                <span className="text-red-400 font-bold">{seriesScore.red}</span>
               </div>
               <div>
-                <span className="text-gray-400">Maps 2+</span>{' '}
+                <span className="text-gray-400">Next map pMap</span>{' '}
+                <span className="text-violet-300 font-semibold">{pct(result.finalWinProbability)}</span>
+                <span className="text-gray-700 ml-1">(draft Map {activeMapIdx + 1})</span>
+              </div>
+              <div>
+                <span className="text-gray-400">Remaining maps</span>{' '}
                 <span className="text-blue-300 font-semibold">{pct(teamStrength.priorBlue)}</span>
-                <span className="text-gray-700 ml-1">(prior only — draft unknown)</span>
+                <span className="text-gray-700 ml-1">(prior only)</span>
               </div>
             </div>
 
