@@ -915,6 +915,30 @@ function MasteryTable({ mastery }: { mastery: PlayerMastery[] }) {
   );
 }
 
+// ─── Draft persistence ────────────────────────────────────────────────────────
+
+const LS_DRAFT_STATE = 'lol-draft-state';
+
+interface DraftPersist {
+  seriesFormat: 'BO1' | 'BO3' | 'BO5';
+  maps: MapDraft[];
+  activeMapIdx: number;
+  weights: DraftWeightsConfig;
+  scoreMix: DraftScoreMixInput;
+  teamStrength: TeamStrengthConfig;
+}
+
+function loadDraftState(): DraftPersist | null {
+  try {
+    const raw = localStorage.getItem(LS_DRAFT_STATE);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function saveDraftState(s: DraftPersist) {
+  try { localStorage.setItem(LS_DRAFT_STATE, JSON.stringify(s)); } catch { /* */ }
+}
+
 // ─── Main page ───────────────────────────────────────────────────────────────
 
 export default function DraftAnalyzerPage() {
@@ -932,6 +956,7 @@ export default function DraftAnalyzerPage() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [activeTab, setActiveTab] = useState<'overview' | 'matchups' | 'synergy' | 'mastery'>('overview');
   const abortRef = useRef<AbortController | null>(null);
+  const [hydrated, setHydrated] = useState(false);
 
   const [pickerChampions, setPickerChampions] = useState<PickerChampionRow[]>([]);
 
@@ -939,6 +964,26 @@ export default function DraftAnalyzerPage() {
   const [mcNSims, setMcNSims] = useState(120_000);
   const [mcResult, setMcResult] = useState<MCResult | null>(null);
   const [mcLoading, setMcLoading] = useState(false);
+
+  // ── Restore persisted draft state on mount ──
+  useEffect(() => {
+    const saved = loadDraftState();
+    if (saved) {
+      setSeriesFormat(saved.seriesFormat);
+      setMaps(saved.maps);
+      setActiveMapIdx(saved.activeMapIdx);
+      setWeights(saved.weights);
+      setScoreMix(saved.scoreMix);
+      setTeamStrength(saved.teamStrength);
+    }
+    setHydrated(true);
+  }, []);
+
+  // ── Persist draft state on every change ──
+  useEffect(() => {
+    if (!hydrated) return;
+    saveDraftState({ seriesFormat, maps, activeMapIdx, weights, scoreMix, teamStrength });
+  }, [seriesFormat, maps, activeMapIdx, weights, scoreMix, teamStrength, hydrated]);
 
   // ── Derived: current map, used champs, series score ──
   const curMap = maps[activeMapIdx] ?? maps[0];
@@ -1050,9 +1095,12 @@ export default function DraftAnalyzerPage() {
       localStorage.setItem('lol-draft-live', JSON.stringify({
         blueChamps, redChamps, bluePlayers, redPlayers,
         pMap: result.finalWinProbability,
+        mapIndex: activeMapIdx,
+        seriesFormat,
+        seriesScore,
       }));
     } catch { /* ignore */ }
-  }, [result, blueChamps, redChamps, bluePlayers, redPlayers]);
+  }, [result, blueChamps, redChamps, bluePlayers, redPlayers, activeMapIdx, seriesFormat, seriesScore]);
 
   const updateMap = useCallback((idx: number, patch: Partial<MapDraft>) => {
     setMaps((prev) => {

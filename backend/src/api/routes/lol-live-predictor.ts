@@ -34,6 +34,7 @@ lolLiveRouter.post('/lol/live/predict', async (req: Request, res: Response) => {
       redBaron: body.redBaron ?? 0,
       blueTowersDestroyed: body.blueTowersDestroyed ?? 0,
       redTowersDestroyed: body.redTowersDestroyed ?? 0,
+      killDiff: body.killDiff ?? 0,
       draftPMap: body.draftPMap,
     };
 

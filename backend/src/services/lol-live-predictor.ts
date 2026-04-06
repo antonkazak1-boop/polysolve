@@ -35,6 +35,8 @@ export interface LiveGameState {
   blueTowersDestroyed: number;
   redTowersDestroyed: number;
 
+  killDiff?: number;
+
   draftPMap?: number;
 }
 
@@ -46,6 +48,7 @@ export interface LivePrediction {
     goldShift: number;
     objectiveShift: number;
     scalingShift: number;
+    killShift: number;
     objectives: ObjectiveBreakdown;
   };
   minute: number;
@@ -504,6 +507,11 @@ export async function predictLive(state: LiveGameState): Promise<LivePrediction>
     towerDelta * 0.5
   );
 
+  // Kill diff shift — each kill advantage is worth ~0.6% WR, dampened because it correlates with gold
+  const KILL_SHIFT_PER_KILL = 0.006;
+  const killDiff = state.killDiff ?? 0;
+  const killShift = killDiff * KILL_SHIFT_PER_KILL;
+
   // Scaling shift
   const [blueScaling, redScaling] = await Promise.all([
     computeScalingScore(state.blueChamps),
@@ -512,7 +520,7 @@ export async function predictLive(state: LiveGameState): Promise<LivePrediction>
   const netScaling = blueScaling - redScaling;
   const scalingShift = netScaling * state.minute * SCALE_PER_MINUTE;
 
-  const pFinal = Math.max(0.02, Math.min(0.98, pAfterGold + objectiveShift + scalingShift));
+  const pFinal = Math.max(0.02, Math.min(0.98, pAfterGold + objectiveShift + scalingShift + killShift));
 
   return {
     pBlue: Math.round(pFinal * 10000) / 10000,
@@ -521,6 +529,7 @@ export async function predictLive(state: LiveGameState): Promise<LivePrediction>
       goldWR: Math.round(goldWR * 10000) / 10000,
       goldShift: Math.round(goldShift * 10000) / 10000,
       objectiveShift: Math.round(objectiveShift * 10000) / 10000,
+      killShift: Math.round(killShift * 10000) / 10000,
       scalingShift: Math.round(scalingShift * 10000) / 10000,
       objectives: {
         firstDragon: Math.round(firstDragonDelta * 0.3 * 10000) / 10000,
