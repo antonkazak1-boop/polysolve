@@ -11,6 +11,7 @@ import { gammaClient, parseOutcomePrices } from '../clients/gamma-client';
 import { getClobPrice, getOwnFreePositionSize } from './copy-trade';
 import { isClobReady, placeSellOrder, getTradingUserAddress } from '../clients/polymarket-clob';
 import { isRegionAllowedForTrading } from '../utils/region-guard';
+import { syncOracleElixir2026FromDrive } from './oracle-elixir-sync';
 
 let started = false;
 
@@ -108,6 +109,23 @@ export function startCron() {
       await takeDemoSnapshot();
     } catch (err: any) {
       console.error('[cron] Demo snapshot failed:', err.message);
+    }
+  });
+
+  // Oracle's Elixir 2026 CSV: публичный Drive + импорт (4×/сутки). Включить: ORACLE_ELIXIR_SYNC_ENABLED=1 (API не обязателен)
+  cron.schedule('0 */6 * * *', async () => {
+    if (process.env.ORACLE_ELIXIR_SYNC_ENABLED !== '1') return;
+    try {
+      console.log('[cron] Oracle Elixir 2026 Drive sync…');
+      const r = await syncOracleElixir2026FromDrive();
+      if (r.error) console.error('[cron] OE sync failed:', r.error);
+      else if (r.importResult) {
+        console.log(
+          `[cron] OE sync OK: +${r.importResult.imported} games, skipped ${r.importResult.skipped}, errors ${r.importResult.errors} → ${r.destPath}`,
+        );
+      }
+    } catch (err: any) {
+      console.error('[cron] OE sync exception:', err?.message);
     }
   });
 }
