@@ -244,47 +244,51 @@ async function importFile(filePath: string) {
               blueGoldDiffAt25: parseFloat_(bt[COL.golddiffat25]),
             };
 
+            const gamePayload = {
+              league: bt[COL.league] || 'Unknown',
+              year: parseInt_(bt[COL.year]) || 2026,
+              split: bt[COL.split] || 'Unknown',
+              playoffs: bt[COL.playoffs] === '1',
+              date: parsedDate,
+              patch: bt[COL.patch] || '',
+              gamelength: parseInt_(bt[COL.gamelength]),
+              blueTeam: bt[COL.teamname] || 'Unknown',
+              redTeam: rt[COL.teamname] || 'Unknown',
+              blueTeamId: bt[COL.teamid] || null,
+              redTeamId: rt[COL.teamid] || null,
+              blueResult: parseInt_(bt[COL.result]),
+              bluePick1: bt[COL.pick1] || null,
+              bluePick2: bt[COL.pick2] || null,
+              bluePick3: bt[COL.pick3] || null,
+              bluePick4: bt[COL.pick4] || null,
+              bluePick5: bt[COL.pick5] || null,
+              redPick1: rt[COL.pick1] || null,
+              redPick2: rt[COL.pick2] || null,
+              redPick3: rt[COL.pick3] || null,
+              redPick4: rt[COL.pick4] || null,
+              redPick5: rt[COL.pick5] || null,
+              blueBan1: bt[COL.ban1] || null,
+              blueBan2: bt[COL.ban2] || null,
+              blueBan3: bt[COL.ban3] || null,
+              blueBan4: bt[COL.ban4] || null,
+              blueBan5: bt[COL.ban5] || null,
+              redBan1: rt[COL.ban1] || null,
+              redBan2: rt[COL.ban2] || null,
+              redBan3: rt[COL.ban3] || null,
+              redBan4: rt[COL.ban4] || null,
+              redBan5: rt[COL.ban5] || null,
+              blueFirstPick: bt[COL.firstPick] === '1',
+              ...objectiveData,
+            };
+
             await tx.oEGame.upsert({
               where: { gameId },
-              update: objectiveData,
-              create: {
-                gameId,
-                league: bt[COL.league] || 'Unknown',
-                year: parseInt_(bt[COL.year]) || 2026,
-                split: bt[COL.split] || 'Unknown',
-                playoffs: bt[COL.playoffs] === '1',
-                date: parsedDate,
-                patch: bt[COL.patch] || '',
-                gamelength: parseInt_(bt[COL.gamelength]),
-                blueTeam: bt[COL.teamname] || 'Unknown',
-                redTeam: rt[COL.teamname] || 'Unknown',
-                blueTeamId: bt[COL.teamid] || null,
-                redTeamId: rt[COL.teamid] || null,
-                blueResult: parseInt_(bt[COL.result]),
-                bluePick1: bt[COL.pick1] || null,
-                bluePick2: bt[COL.pick2] || null,
-                bluePick3: bt[COL.pick3] || null,
-                bluePick4: bt[COL.pick4] || null,
-                bluePick5: bt[COL.pick5] || null,
-                redPick1: rt[COL.pick1] || null,
-                redPick2: rt[COL.pick2] || null,
-                redPick3: rt[COL.pick3] || null,
-                redPick4: rt[COL.pick4] || null,
-                redPick5: rt[COL.pick5] || null,
-                blueBan1: bt[COL.ban1] || null,
-                blueBan2: bt[COL.ban2] || null,
-                blueBan3: bt[COL.ban3] || null,
-                blueBan4: bt[COL.ban4] || null,
-                blueBan5: bt[COL.ban5] || null,
-                redBan1: rt[COL.ban1] || null,
-                redBan2: rt[COL.ban2] || null,
-                redBan3: rt[COL.ban3] || null,
-                redBan4: rt[COL.ban4] || null,
-                redBan5: rt[COL.ban5] || null,
-                blueFirstPick: bt[COL.firstPick] === '1',
-                ...objectiveData,
-              },
+              update: gamePayload,
+              create: { gameId, ...gamePayload },
             });
+
+            // Replace player rows (no unique constraint — re-import would duplicate otherwise)
+            await tx.oEPlayerGame.deleteMany({ where: { gameId } });
 
             // Player rows
             for (const pr of playerRows) {
@@ -348,6 +352,7 @@ async function main() {
       '/Users/tony/Downloads/2024_LoL_esports_match_data_from_OraclesElixir.csv',
       '/Users/tony/Downloads/2025_LoL_esports_match_data_from_OraclesElixir.csv',
       '/Users/tony/Downloads/2026_LoL_esports_match_data_from_OraclesElixir.csv',
+      '/Users/tony/Downloads/2026_LoL_esports_match_data_from_OraclesElixir-2.csv',
     ].filter((f) => fs.existsSync(f));
 
     if (defaultFiles.length === 0) {

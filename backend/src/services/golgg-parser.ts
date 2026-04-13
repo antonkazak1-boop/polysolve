@@ -236,11 +236,48 @@ function parseSummaryTeamTotals(html: string): Record<string, unknown>[] | null 
 function parseMetaExtra(html: string): Record<string, unknown> {
   const gameTime = html.match(/Game Time[\s\S]{0,80}?<h1>(\d+:\d+)<\/h1>/i);
   const patch = html.match(/Game Time[\s\S]{0,200}?\b(v\d+\.\d+)\b/i);
-  const winner = html.match(/([\w\s]+)\s*-\s*WIN/i);
+
+  // Winner detection: look for blue-line-header / red-line-header divs with - WIN / - LOSS
+  // Format: <div class="col-12 blue-line-header">...<a ...>TEAM NAME</a>\n - WIN</div>
+  let winnerSide: 'blue' | 'red' | null = null;
+  let winnerTeam: string | null = null;
+  let loserTeam: string | null = null;
+
+  const blueBlock = html.match(/blue-line-header[\s\S]*?<a[^>]*>([^<]+)<\/a>\s*-\s*(WIN|LOSS)\s*<\/div>/i);
+  const redBlock = html.match(/red-line-header[\s\S]*?<a[^>]*>([^<]+)<\/a>\s*-\s*(WIN|LOSS)\s*<\/div>/i);
+
+  if (blueBlock) {
+    const blueTeam = blueBlock[1].trim();
+    const blueResult = blueBlock[2].toUpperCase();
+    if (blueResult === 'WIN') {
+      winnerSide = 'blue';
+      winnerTeam = blueTeam;
+    } else {
+      loserTeam = blueTeam;
+    }
+  }
+  if (redBlock) {
+    const redTeam = redBlock[1].trim();
+    const redResult = redBlock[2].toUpperCase();
+    if (redResult === 'WIN') {
+      winnerSide = 'red';
+      winnerTeam = redTeam;
+    } else {
+      if (!loserTeam) loserTeam = redTeam;
+    }
+  }
+  if (!winnerSide && !winnerTeam) {
+    // Fallback: inline "TEAM - WIN" (old format)
+    const fallback = html.match(/>([^<]+?)\s*-\s*WIN\s*</i);
+    if (fallback) winnerTeam = fallback[1].trim();
+  }
+
   return {
     gameTimeLabel: gameTime ? gameTime[1] : null,
     patch: gameTime && patch ? patch[1] : null,
-    winnerHint: winner ? winner[1].trim() : null,
+    winnerHint: winnerTeam,
+    winnerSide,
+    loserTeam,
   };
 }
 

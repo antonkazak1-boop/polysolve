@@ -34,7 +34,6 @@ lolLiveRouter.post('/lol/live/predict', async (req: Request, res: Response) => {
       redBaron: body.redBaron ?? 0,
       blueTowersDestroyed: body.blueTowersDestroyed ?? 0,
       redTowersDestroyed: body.redTowersDestroyed ?? 0,
-      killDiff: body.killDiff ?? 0,
       draftPMap: body.draftPMap,
     };
 
@@ -48,8 +47,8 @@ lolLiveRouter.post('/lol/live/predict', async (req: Request, res: Response) => {
 
 lolLiveRouter.get('/lol/live/gold-curves', async (_req: Request, res: Response) => {
   try {
-    const curves = await buildGoldCurves();
-    res.json(curves);
+    const { curves, goldModel } = await buildGoldCurves();
+    res.json({ curves, goldModel });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

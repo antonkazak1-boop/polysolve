@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
+  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceDot,
 } from 'recharts';
 import api from '@/lib/api';
 
@@ -17,12 +17,23 @@ interface ObjectiveBreakdown {
   grubAdvantage: number; towerDiff: number;
 }
 
+interface LiveGoldModelMeta {
+  source: 'gol.gg' | 'oracle_elixir';
+  sampleGames: number;
+  minutesCovered: number;
+}
+
 interface LivePrediction {
   pBlue: number;
   breakdown: {
     draftBaseline: number; goldWR: number; goldShift: number;
-    objectiveShift: number; killShift: number; scalingShift: number;
+    draftAnchorWeight?: number;
+    goldLookupMinute?: number;
+    /** 0–1 historical gold muted toward draft */
+    goldHistoricalMute?: number;
+    objectiveShift: number; scalingShift: number;
     objectives: ObjectiveBreakdown;
+    goldModel?: LiveGoldModelMeta;
   };
   minute: number;
 }
@@ -41,8 +52,16 @@ interface DraftData {
 
 interface GameState {
   minute: number;
+  /** Match clock: wall time since start/resume; null = paused / not started. */
+  matchStartedAtMs: number | null;
+  matchTimerRunning: boolean;
+  /** Total game seconds (0..3600) when paused — exact MM:SS. */
+  gameClockTotalSeconds: number;
+  /** Total game seconds at the moment Start was pressed; used with wall elapsed while running. */
+  matchBaselineTotalSeconds: number;
+  /** Extra whole minutes while timer runs (+/- buttons). */
+  minuteManualAdjust: number;
   goldDiff: number;
-  killDiff: number;
   showLaneGold: boolean;
   laneGold: { top: number; jng: number; mid: number; bot: number; sup: number };
   blueDragons: DragonType[]; redDragons: DragonType[];
@@ -81,16 +100,46 @@ const DRAGON_LABELS: Record<DragonType, string> = {
 const LS_SESSIONS = 'lol-live-sessions';
 const LS_ACTIVE = 'lol-live-active';
 const LS_DRAFT = 'lol-draft-live';
+const MAX_GAME_MINUTE = 60;
+const MAX_GAME_SECONDS = MAX_GAME_MINUTE * 60;
 
 function emptyState(): GameState {
   return {
-    minute: 0, goldDiff: 0, killDiff: 0, showLaneGold: false,
+    minute: 0,
+    matchStartedAtMs: null,
+    matchTimerRunning: false,
+    gameClockTotalSeconds: 0,
+    matchBaselineTotalSeconds: 0,
+    minuteManualAdjust: 0,
+    goldDiff: 0, showLaneGold: false,
     laneGold: { top: 0, jng: 0, mid: 0, bot: 0, sup: 0 },
     blueDragons: [], redDragons: [], blueSoul: false, redSoul: false,
     blueElder: 0, redElder: 0, blueGrubs: 0, redGrubs: 0,
     blueHerald: 0, redHerald: 0, blueBaron: 0, redBaron: 0,
     blueTowers: 0, redTowers: 0,
   };
+}
+
+/** Total game time in seconds (real-time tick + manual ±). */
+function deriveTotalGameSeconds(st: GameState): number {
+  if (st.matchTimerRunning && st.matchStartedAtMs != null) {
+    const elapsed = Math.floor((Date.now() - st.matchStartedAtMs) / 1000);
+    const base = st.matchBaselineTotalSeconds + st.minuteManualAdjust * 60;
+    return clamp(base + elapsed, 0, MAX_GAME_SECONDS);
+  }
+  return clamp(st.gameClockTotalSeconds, 0, MAX_GAME_SECONDS);
+}
+
+/** Integer minute for API / gold curves (floor of game clock). */
+function deriveGameMinute(st: GameState): number {
+  return Math.min(MAX_GAME_MINUTE, Math.floor(deriveTotalGameSeconds(st) / 60));
+}
+
+function formatGameClockMMSS(st: GameState): string {
+  const sec = deriveTotalGameSeconds(st);
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 function newSession(name: string, draft: DraftData | null): LiveSession {
@@ -104,10 +153,16 @@ function newSession(name: string, draft: DraftData | null): LiveSession {
 function loadSessions(): LiveSession[] {
   try {
     const raw: LiveSession[] = JSON.parse(localStorage.getItem(LS_SESSIONS) || '[]');
-    return raw.map(s => ({
-      ...s,
-      state: { ...emptyState(), ...s.state },
-    }));
+    return raw.map(s => {
+      const merged = { ...emptyState(), ...s.state } as GameState;
+      if (typeof (s.state as Partial<GameState>).gameClockTotalSeconds !== 'number') {
+        merged.gameClockTotalSeconds = clamp((merged.minute ?? 0) * 60, 0, MAX_GAME_SECONDS);
+      }
+      if (typeof (s.state as Partial<GameState>).matchBaselineTotalSeconds !== 'number') {
+        merged.matchBaselineTotalSeconds = 0;
+      }
+      return { ...s, state: merged };
+    });
   } catch { return []; }
 }
 function saveSessions(sessions: LiveSession[]) {
@@ -213,29 +268,203 @@ function FactorRow({ label, value, tip }: { label: string; value: number; tip?: 
   );
 }
 
-function GoldCurveChart({ curves, currentMinute, currentGold }: { curves: GoldCurveData[]; currentMinute: number; currentGold: number; }) {
-  const nearest = useMemo(() => {
-    if (!curves.length) return null;
-    let best = curves[0];
-    for (const c of curves) if (Math.abs(c.minute - currentMinute) < Math.abs(best.minute - currentMinute)) best = c;
-    return best;
-  }, [curves, currentMinute]);
-  if (!nearest || nearest.points.length < 2) return null;
-  const data = nearest.points.map(p => ({ gold: p.goldDiffBucket, wr: Math.round(p.blueWinRate * 1000) / 10 }));
+function goldModelLabel(m?: LiveGoldModelMeta | null): string {
+  if (!m) return '';
+  const src = m.source === 'gol.gg' ? 'gol.gg' : "Oracle's Elixir";
+  return `${src} · ${m.sampleGames.toLocaleString()} games · ${m.minutesCovered} min buckets`;
+}
+
+function interpolateCurveWR(points: GoldCurvePoint[], goldDiff: number): number {
+  if (!points.length) return 50;
+  if (goldDiff <= points[0].goldDiffBucket) return points[0].blueWinRate * 100;
+  if (goldDiff >= points[points.length - 1].goldDiffBucket) return points[points.length - 1].blueWinRate * 100;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const a = points[i];
+    const b = points[i + 1];
+    if (goldDiff >= a.goldDiffBucket && goldDiff < b.goldDiffBucket) {
+      const t = (goldDiff - a.goldDiffBucket) / (b.goldDiffBucket - a.goldDiffBucket);
+      return (a.blueWinRate + t * (b.blueWinRate - a.blueWinRate)) * 100;
+    }
+  }
+  return 50;
+}
+
+function interpolateHistoricalWR(curves: GoldCurveData[], minute: number, goldDiff: number): number {
+  if (!curves.length) return 50;
+
+  const findWR = (curve: GoldCurveData, gd: number): number => interpolateCurveWR(curve.points, gd);
+
+  const densePerMinute = curves.length >= 12;
+  if (densePerMinute) {
+    const nearestTo = (target: number): GoldCurveData => {
+      let best = curves[0];
+      let bestDist = Math.abs(curves[0].minute - target);
+      for (let i = 1; i < curves.length; i += 1) {
+        const c = curves[i];
+        const d = Math.abs(c.minute - target);
+        if (d < bestDist || (d === bestDist && c.minute < best.minute)) {
+          best = c;
+          bestDist = d;
+        }
+      }
+      return best;
+    };
+
+    const seen = new Set<number>();
+    let sum = 0;
+    let n = 0;
+    for (const tm of [minute - 2, minute - 1, minute, minute + 1, minute + 2]) {
+      if (tm < 0) continue;
+      const c = nearestTo(tm);
+      if (seen.has(c.minute)) continue;
+      seen.add(c.minute);
+      sum += findWR(c, goldDiff);
+      n += 1;
+    }
+    return n > 0 ? sum / n : 50;
+  }
+
+  let lower: GoldCurveData | null = null;
+  let upper: GoldCurveData | null = null;
+  for (const c of curves) {
+    if (c.minute <= minute && (!lower || c.minute > lower.minute)) lower = c;
+    if (c.minute >= minute && (!upper || c.minute < upper.minute)) upper = c;
+  }
+
+  if (!lower && !upper) return 50;
+  if (!lower) return findWR(upper!, goldDiff);
+  if (!upper) return findWR(lower!, goldDiff);
+  if (lower.minute === upper.minute) return findWR(lower, goldDiff);
+
+  const wrLower = findWR(lower, goldDiff);
+  const wrUpper = findWR(upper, goldDiff);
+  const t = (minute - lower.minute) / (upper.minute - lower.minute);
+  return wrLower + t * (wrUpper - wrLower);
+}
+
+function GoldCurveChart({ curves, currentMinute, currentGold, goldModel, prediction }: {
+  curves: GoldCurveData[]; currentMinute: number; currentGold: number;
+  goldModel?: LiveGoldModelMeta | null;
+  prediction?: LivePrediction | null;
+}) {
+  const [viewMode, setViewMode] = useState<'all' | 'historical' | 'model' | 'final'>('all');
+  const lookupMinute = prediction?.breakdown.goldLookupMinute ?? currentMinute;
+  const chartData = useMemo(() => {
+    if (!curves.length) return [];
+    const buckets = Array.from(new Set(curves.flatMap(curve => curve.points.map(p => p.goldDiffBucket)))).sort((a, b) => a - b);
+    const draftBaseline = prediction?.breakdown.draftBaseline != null ? prediction.breakdown.draftBaseline * 100 : 50;
+    const draftAnchorWeight = prediction?.breakdown.draftAnchorWeight ?? 1;
+    const goldHistoricalMute = prediction?.breakdown.goldHistoricalMute ?? 0;
+    const objectiveShift = (prediction?.breakdown.objectiveShift ?? 0) * 100;
+    const scalingShift = (prediction?.breakdown.scalingShift ?? 0) * 100;
+
+    return buckets.map(gold => {
+      const historical = interpolateHistoricalWR(curves, lookupMinute, gold);
+      const mutedHistorical = historical * (1 - goldHistoricalMute) + draftBaseline * goldHistoricalMute;
+      const model = draftBaseline * draftAnchorWeight + mutedHistorical * (1 - draftAnchorWeight);
+      const final = clamp(model + objectiveShift + scalingShift, 2, 98);
+      return {
+        gold,
+        historical: Math.round(historical * 10) / 10,
+        model: Math.round(model * 10) / 10,
+        final: Math.round(final * 10) / 10,
+      };
+    });
+  }, [curves, lookupMinute, prediction]);
+  if (chartData.length < 2) return null;
+  const rawCurrentWR = interpolateHistoricalWR(curves, lookupMinute, currentGold);
+  const modelGoldWR = prediction?.breakdown.goldShift != null && prediction?.breakdown.draftBaseline != null
+    ? (prediction.breakdown.draftBaseline + prediction.breakdown.goldShift) * 100
+    : null;
+  const finalWR = prediction != null ? prediction.pBlue * 100 : null;
+  const showHistorical = viewMode === 'all' || viewMode === 'historical';
+  const showModel = viewMode === 'all' || viewMode === 'model';
+  const showFinal = viewMode === 'all' || viewMode === 'final';
   return (
-    <div className="bg-gray-900/50 border border-gray-800 rounded-lg p-3">
-      <div className="text-[10px] text-gray-500 mb-2">Gold diff &rarr; Win% (closest: {nearest.minute}min)</div>
-      <div className="h-32">
+    <div className="bg-gray-900/50 border border-gray-800 rounded-lg p-4">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div>
+          <div className="text-xs text-gray-400">Gold curves comparison</div>
+          <div className="text-[10px] text-gray-500 mt-0.5">
+            Historical = raw data curve. Model = gold step after averaging, mute and draft blend.
+            Final = model plus objectives and scaling.
+          </div>
+        </div>
+        <div className="text-[10px] text-right text-gray-500 shrink-0">
+          <div>clock: <span className="font-mono text-gray-300">{currentMinute}m</span></div>
+          <div>gold lookup: <span className="font-mono text-gray-300">{lookupMinute}m</span></div>
+        </div>
+      </div>
+      {goldModel && (
+        <div className="text-[9px] text-cyan-600/90 mb-2 font-mono">{goldModelLabel(goldModel)}</div>
+      )}
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        {[
+          ['all', 'All lines'],
+          ['historical', 'Historical'],
+          ['model', 'Model'],
+          ['final', 'Final'],
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setViewMode(id as 'all' | 'historical' | 'model' | 'final')}
+            className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
+              viewMode === id
+                ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300'
+                : 'bg-gray-950/60 border-gray-800 text-gray-400 hover:text-gray-200'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="grid grid-cols-3 gap-2 mb-3">
+        <div className="rounded-lg border border-gray-800 bg-gray-950/60 px-3 py-2">
+          <div className="text-[10px] text-gray-500">Raw historical</div>
+          <div className="text-sm font-mono text-blue-300">{rawCurrentWR.toFixed(1)}%</div>
+        </div>
+        <div className="rounded-lg border border-gray-800 bg-gray-950/60 px-3 py-2">
+          <div className="text-[10px] text-gray-500">Model gold step</div>
+          <div className="text-sm font-mono text-cyan-300">{modelGoldWR != null ? `${modelGoldWR.toFixed(1)}%` : '—'}</div>
+        </div>
+        <div className="rounded-lg border border-gray-800 bg-gray-950/60 px-3 py-2">
+          <div className="text-[10px] text-gray-500">Final live</div>
+          <div className="text-sm font-mono text-amber-300">{finalWR != null ? `${finalWR.toFixed(1)}%` : '—'}</div>
+        </div>
+      </div>
+      <div className="h-56">
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data}>
-            <XAxis dataKey="gold" stroke="#4b5563" tick={{ fontSize: 9 }} tickFormatter={v => v > 0 ? `+${(v / 1000).toFixed(0)}k` : `${(v / 1000).toFixed(0)}k`} />
-            <YAxis domain={[10, 90]} stroke="#4b5563" tick={{ fontSize: 9 }} tickFormatter={v => `${v}%`} />
-            <Tooltip contentStyle={{ background: '#111827', border: '1px solid #374151', fontSize: 10 }} formatter={(v: number) => [`${v}%`, 'Blue WR']} labelFormatter={(l: number) => `Gold diff: ${l > 0 ? '+' : ''}${l}`} />
+          <LineChart data={chartData}>
+            <XAxis dataKey="gold" stroke="#4b5563" tick={{ fontSize: 11 }} tickFormatter={v => v > 0 ? `+${(v / 1000).toFixed(0)}k` : `${(v / 1000).toFixed(0)}k`} />
+            <YAxis domain={[10, 90]} stroke="#4b5563" tick={{ fontSize: 11 }} tickFormatter={v => `${v}%`} />
+            <Tooltip
+              contentStyle={{ background: '#111827', border: '1px solid #374151', fontSize: 11 }}
+              formatter={(v: number, name: string) => {
+                const labelMap: Record<string, string> = {
+                  historical: 'Historical WR',
+                  model: 'Model Gold Step',
+                  final: 'Final Live WR',
+                };
+                return [`${v}%`, labelMap[name] ?? name];
+              }}
+              labelFormatter={(l: number) => `Gold diff: ${l > 0 ? '+' : ''}${l}`}
+            />
             <ReferenceLine y={50} stroke="#4b5563" strokeDasharray="3 3" />
-            <ReferenceLine x={currentGold} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: 'NOW', fontSize: 9, fill: '#f59e0b' }} />
-            <Line type="monotone" dataKey="wr" stroke="#60a5fa" strokeWidth={2} dot={false} />
+            <ReferenceLine x={currentGold} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: 'NOW', fontSize: 10, fill: '#f59e0b' }} />
+            {showHistorical && <ReferenceDot x={currentGold} y={rawCurrentWR} r={4} fill="#60a5fa" stroke="none" />}
+            {showModel && modelGoldWR != null && <ReferenceDot x={currentGold} y={modelGoldWR} r={4} fill="#22d3ee" stroke="none" />}
+            {showFinal && finalWR != null && <ReferenceDot x={currentGold} y={finalWR} r={4} fill="#f59e0b" stroke="none" />}
+            {showHistorical && <Line type="monotone" dataKey="historical" name="historical" stroke="#60a5fa" strokeWidth={3} dot={false} />}
+            {showModel && <Line type="monotone" dataKey="model" name="model" stroke="#22d3ee" strokeWidth={3} dot={false} />}
+            {showFinal && <Line type="monotone" dataKey="final" name="final" stroke="#f59e0b" strokeWidth={3} dot={false} />}
           </LineChart>
         </ResponsiveContainer>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-gray-500">
+        <span><span className="text-blue-300">Blue line/dot</span>: raw historical curve</span>
+        <span><span className="text-cyan-300">Cyan</span>: model gold step after averaging/mute/blend</span>
+        <span><span className="text-amber-300">Amber</span>: final live win%</span>
       </div>
     </div>
   );
@@ -317,6 +546,7 @@ export default function LivePredictorPage() {
 
   // Shared
   const [goldCurves, setGoldCurves] = useState<GoldCurveData[]>([]);
+  const [goldModelMeta, setGoldModelMeta] = useState<LiveGoldModelMeta | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
@@ -324,7 +554,16 @@ export default function LivePredictorPage() {
 
   // ─── Init: load sessions, auto-load draft ────────────────────────────────
   useEffect(() => {
-    api.get('/lol/live/gold-curves').then(r => setGoldCurves(r.data)).catch(() => {});
+    api.get('/lol/live/gold-curves').then((r) => {
+      const d = r.data;
+      if (Array.isArray(d)) {
+        setGoldCurves(d);
+        setGoldModelMeta(null);
+      } else {
+        setGoldCurves(d?.curves ?? []);
+        setGoldModelMeta(d?.goldModel ?? null);
+      }
+    }).catch(() => {});
 
     let stored = loadSessions();
     const savedActiveId = loadActiveId();
@@ -386,6 +625,28 @@ export default function LivePredictorPage() {
     });
   }, [activeId]);
 
+  // MM:SS needs a re-render every wall second; integer `minute` in state only when it changes (predict/API).
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    if (!activeId || !session?.state.matchTimerRunning || session.state.matchStartedAtMs == null) return;
+    const id = window.setInterval(() => {
+      setClockTick((n) => n + 1);
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.id === activeId);
+        if (idx < 0) return prev;
+        const s = prev[idx];
+        if (!s.state.matchTimerRunning || s.state.matchStartedAtMs == null) return prev;
+        const m = deriveGameMinute(s.state);
+        if (m === s.state.minute) return prev;
+        const next = [...prev];
+        next[idx] = { ...s, state: { ...s.state, minute: m } };
+        saveSessions(next);
+        return next;
+      });
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [activeId, session?.state.matchTimerRunning, session?.state.matchStartedAtMs]);
+
   // ─── Auto-predict ─────────────────────────────────────────────────────────
   const predict = useCallback(async () => {
     if (!session) return;
@@ -393,11 +654,12 @@ export default function LivePredictorPage() {
     setError('');
     try {
       const s = session.state;
+      const gameMin = deriveGameMinute(s);
       const totalGold = s.showLaneGold ? Object.values(s.laneGold).reduce((a, b) => a + b, 0) : s.goldDiff;
       const body = {
         blueChamps: session.draft?.blueChamps ?? [],
         redChamps: session.draft?.redChamps ?? [],
-        minute: s.minute, goldDiffTotal: totalGold,
+        minute: gameMin, goldDiffTotal: totalGold,
         goldDiffByLane: s.showLaneGold ? s.laneGold : undefined,
         blueDragons: s.blueDragons, redDragons: s.redDragons,
         blueDragonSoul: s.blueSoul, redDragonSoul: s.redSoul,
@@ -406,7 +668,6 @@ export default function LivePredictorPage() {
         blueHerald: s.blueHerald, redHerald: s.redHerald,
         blueBaron: s.blueBaron, redBaron: s.redBaron,
         blueTowersDestroyed: s.blueTowers, redTowersDestroyed: s.redTowers,
-        killDiff: s.killDiff,
         draftPMap: session.draft?.pMap ?? undefined,
       };
       const res = await api.post('/lol/live/predict', body);
@@ -414,7 +675,7 @@ export default function LivePredictorPage() {
       setSessions(prev => {
         const next = prev.map(ss => {
           if (ss.id !== activeId) return ss;
-          const h = [...ss.history.filter(h => h.min !== s.minute), { min: s.minute, pBlue: pred.pBlue }].sort((a, b) => a.min - b.min);
+          const h = [...ss.history.filter(h => h.min !== gameMin), { min: gameMin, pBlue: pred.pBlue }].sort((a, b) => a.min - b.min);
           return { ...ss, lastPrediction: pred, history: h };
         });
         saveSessions(next);
@@ -488,6 +749,57 @@ export default function LivePredictorPage() {
   // ─── Derived ──────────────────────────────────────────────────────────────
   const totalGold = st.showLaneGold ? Object.values(st.laneGold).reduce((a, b) => a + b, 0) : st.goldDiff;
   const bd = prediction?.breakdown;
+  const displayMinute = deriveGameMinute(st);
+  const displayClockMMSS = formatGameClockMMSS(st);
+  const goldCurveMeta = bd?.goldModel ?? goldModelMeta;
+
+  const startMatchTimer = () => {
+    const baseSec = clamp(st.gameClockTotalSeconds, 0, MAX_GAME_SECONDS);
+    updateState({
+      matchTimerRunning: true,
+      matchStartedAtMs: Date.now(),
+      matchBaselineTotalSeconds: baseSec,
+      minuteManualAdjust: 0,
+      minute: Math.min(MAX_GAME_MINUTE, Math.floor(baseSec / 60)),
+      gameClockTotalSeconds: baseSec,
+    });
+  };
+
+  const pauseMatchTimer = () => {
+    const total = deriveTotalGameSeconds(st);
+    const m = Math.min(MAX_GAME_MINUTE, Math.floor(total / 60));
+    updateState({
+      gameClockTotalSeconds: total,
+      minute: m,
+      matchTimerRunning: false,
+      matchStartedAtMs: null,
+      matchBaselineTotalSeconds: 0,
+      minuteManualAdjust: 0,
+    });
+  };
+
+  const resetMatchTimer = () => {
+    updateState({
+      minute: 0,
+      gameClockTotalSeconds: 0,
+      matchTimerRunning: false,
+      matchStartedAtMs: null,
+      matchBaselineTotalSeconds: 0,
+      minuteManualAdjust: 0,
+    });
+  };
+
+  const bumpMatchMinute = (delta: number) => {
+    if (st.matchTimerRunning && st.matchStartedAtMs != null) {
+      updateState({ minuteManualAdjust: st.minuteManualAdjust + delta });
+    } else {
+      const nextSec = clamp(st.gameClockTotalSeconds + delta * 60, 0, MAX_GAME_SECONDS);
+      updateState({
+        gameClockTotalSeconds: nextSec,
+        minute: Math.min(MAX_GAME_MINUTE, Math.floor(nextSec / 60)),
+      });
+    }
+  };
 
   if (!session) return null;
 
@@ -573,15 +885,62 @@ export default function LivePredictorPage() {
           {/* Minute + Gold */}
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
             <div className="text-[10px] text-gray-500 font-medium uppercase tracking-wide">Game State</div>
-            <div className="grid grid-cols-3 gap-4">
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] text-gray-500">Minute</span>
-                  <span className="text-lg font-bold text-white font-mono">{st.minute}</span>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-gray-500 shrink-0">Время матча</span>
+                  <div className="text-right">
+                    <span className="text-2xl font-bold text-cyan-400 font-mono tabular-nums tracking-tight">{displayClockMMSS}</span>
+                    <div className="text-[9px] text-gray-600 font-mono mt-0.5">модель: {displayMinute} мин</div>
+                  </div>
                 </div>
-                <input type="range" min={0} max={60} value={st.minute} onChange={e => updateState({ minute: parseInt(e.target.value) })}
-                  className="w-full h-2 rounded-full appearance-none bg-gray-700 accent-cyan-500 cursor-pointer" />
-                <div className="flex justify-between text-[9px] text-gray-600"><span>0</span><span>15</span><span>30</span><span>45</span><span>60</span></div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {!st.matchTimerRunning ? (
+                    <button
+                      type="button"
+                      onClick={startMatchTimer}
+                      className="text-[10px] px-2.5 py-1 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-medium transition-colors"
+                    >
+                      Старт
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={pauseMatchTimer}
+                      className="text-[10px] px-2.5 py-1 rounded-lg bg-amber-600/90 hover:bg-amber-500 text-white font-medium transition-colors"
+                    >
+                      Пауза
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={resetMatchTimer}
+                    className="text-[10px] px-2 py-1 rounded-lg border border-gray-600 text-gray-400 hover:bg-gray-800 transition-colors"
+                  >
+                    Сброс
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => bumpMatchMinute(-1)}
+                    className="text-[10px] px-2 py-1 rounded-lg border border-gray-600 text-gray-300 hover:bg-gray-800 font-mono"
+                    title="Минус одна минута игры"
+                  >
+                    −1
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => bumpMatchMinute(1)}
+                    className="text-[10px] px-2 py-1 rounded-lg border border-gray-600 text-gray-300 hover:bg-gray-800 font-mono"
+                    title="Плюс одна минута игры"
+                  >
+                    +1
+                  </button>
+                </div>
+                <p className="text-[9px] text-gray-600 leading-snug">
+                  {st.matchTimerRunning
+                    ? 'Секунды идут как реальное время. ±1 мин — подогнать к трансляции. В API уходит целая минута (см. строку «модель»).'
+                    : 'Старт — отсчёт MM:SS; пауза — зафиксировать время; на паузе ±1 сдвигает на целую минуту.'}
+                </p>
               </div>
               <div className="space-y-1">
                 <NumberStepper label="Gold" value={st.showLaneGold ? totalGold : st.goldDiff}
@@ -593,14 +952,6 @@ export default function LivePredictorPage() {
                     {st.showLaneGold ? 'By Lane ON' : 'By Lane'}
                   </button>
                   {st.showLaneGold && <span className="text-[9px] text-gray-600 font-mono">Total: {totalGold > 0 ? '+' : ''}{totalGold}</span>}
-                </div>
-              </div>
-              <div className="space-y-1">
-                <NumberStepper label="Kills" value={st.killDiff}
-                  onChange={v => updateState({ killDiff: v })}
-                  min={-40} max={40} step={1} />
-                <div className="text-[9px] text-gray-600 mt-1">
-                  {st.killDiff > 0 ? `Blue +${st.killDiff}` : st.killDiff < 0 ? `Red +${Math.abs(st.killDiff)}` : 'Even'}
                 </div>
               </div>
             </div>
@@ -665,8 +1016,11 @@ export default function LivePredictorPage() {
               <>
                 <div className="space-y-0.5">
                   <FactorRow label="Draft Baseline" value={bd.draftBaseline - 0.5} tip="Draft analysis pMap - 50%" />
-                  <FactorRow label="Gold Impact" value={bd.goldShift} tip={`Gold WR at ${st.minute}min: ${pct(bd.goldWR)}`} />
-                  <FactorRow label="Kill Diff" value={bd.killShift} tip={`Kill diff: ${st.killDiff > 0 ? '+' : ''}${st.killDiff}`} />
+                  <FactorRow
+                    label="Gold Impact"
+                    value={bd.goldShift}
+                    tip={`Model gold step: ${pct(bd.goldWR)}. Lookup minute: ${bd.goldLookupMinute ?? displayMinute}. Historical gold mute 33→55m: ${((bd.goldHistoricalMute ?? 0) * 100).toFixed(0)}%. Blend: ${((1 - (bd.draftAnchorWeight ?? 1)) * 100).toFixed(0)}% curve / ${((bd.draftAnchorWeight ?? 1) * 100).toFixed(0)}% draft.${bd.goldModel ? ` ${bd.goldModel.sampleGames.toLocaleString()} games.` : ''}`}
+                  />
                   <FactorRow label="Objectives" value={bd.objectiveShift} />
                   <FactorRow label="Scaling" value={bd.scalingShift} />
                 </div>
@@ -693,26 +1047,6 @@ export default function LivePredictorPage() {
 
           <BaronTimer />
 
-          <GoldCurveChart curves={goldCurves} currentMinute={st.minute} currentGold={totalGold} />
-
-          {history.length >= 2 && (
-            <div className="bg-gray-900/50 border border-gray-800 rounded-lg p-3">
-              <div className="text-[10px] text-gray-500 mb-2">Win% over time</div>
-              <div className="h-28">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={history}>
-                    <XAxis dataKey="min" stroke="#4b5563" tick={{ fontSize: 9 }} tickFormatter={v => `${v}m`} />
-                    <YAxis domain={[0, 1]} stroke="#4b5563" tick={{ fontSize: 9 }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
-                    <Tooltip contentStyle={{ background: '#111827', border: '1px solid #374151', fontSize: 10 }}
-                      formatter={(v: number) => [`${(v * 100).toFixed(1)}%`, 'Blue WR']} labelFormatter={l => `Min ${l}`} />
-                    <ReferenceLine y={0.5} stroke="#4b5563" strokeDasharray="3 3" />
-                    <Line type="monotone" dataKey="pBlue" stroke="#60a5fa" strokeWidth={2} dot={{ r: 3 }} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          )}
-
           {/* All sessions summary */}
           {sessions.length > 1 && (
             <div className="bg-gray-900/50 border border-gray-800 rounded-lg p-3">
@@ -731,6 +1065,39 @@ export default function LivePredictorPage() {
             </div>
           )}
         </div>
+      </div>
+
+      <div className="flex flex-wrap justify-center gap-4">
+        <div className="w-full max-w-[900px]">
+          <GoldCurveChart
+            curves={goldCurves}
+            currentMinute={displayMinute}
+            currentGold={totalGold}
+            goldModel={goldCurveMeta}
+            prediction={prediction}
+          />
+        </div>
+
+        {history.length >= 2 && (
+          <div className="w-full max-w-[900px] bg-gray-900/50 border border-gray-800 rounded-lg p-4">
+            <div className="text-xs text-gray-400 mb-2">Win% over time</div>
+            <div className="h-52">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={history}>
+                  <XAxis dataKey="min" stroke="#4b5563" tick={{ fontSize: 11 }} tickFormatter={v => `${v}m`} />
+                  <YAxis domain={[0, 1]} stroke="#4b5563" tick={{ fontSize: 11 }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                  <Tooltip
+                    contentStyle={{ background: '#111827', border: '1px solid #374151', fontSize: 11 }}
+                    formatter={(v: number) => [`${(v * 100).toFixed(1)}%`, 'Blue WR']}
+                    labelFormatter={l => `Min ${l}`}
+                  />
+                  <ReferenceLine y={0.5} stroke="#4b5563" strokeDasharray="3 3" />
+                  <Line type="monotone" dataKey="pBlue" stroke="#60a5fa" strokeWidth={3} dot={{ r: 3.5 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

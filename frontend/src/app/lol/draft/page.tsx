@@ -64,18 +64,30 @@ interface PlayerMastery {
   noProData?: boolean;
 }
 
+interface ChampionScaling {
+  champion: string;
+  scalingScore: number;  // -1..+1
+  wrEarly: number;
+  wrLate: number;
+  gamesEarly: number;
+  gamesLate: number;
+  tag: 'scaling' | 'early' | 'neutral';
+}
+
 interface DraftScore {
   teamSide: string;
   championTier: number;
   synergyScore: number;
   matchupScore: number;
   masteryScore: number;
+  scalingScore: number;
   totalScore: number;
   components: {
     champions: ChampionWR[];
     synergies: SynergyPair[];
     matchups: MatchupStat[];
     mastery: PlayerMastery[];
+    scaling: ChampionScaling[];
   };
 }
 
@@ -106,6 +118,7 @@ interface DraftResult {
   blueWinProbability: number;
   advantage: 'BLUE' | 'RED' | 'EVEN';
   advantageMargin: number;
+  scalingBalance?: number;
   patchesUsed: string[];
   gamesAnalyzed: number;
   weightsApplied?: DraftWeightsConfig;
@@ -740,8 +753,9 @@ function ChampInput({
 
 // ─── Component: Detail tables ────────────────────────────────────────────────
 
-function ChampTable({ champs, side }: { champs: ChampionWR[]; side: 'blue' | 'red' }) {
+function ChampTable({ champs, side, scaling }: { champs: ChampionWR[]; side: 'blue' | 'red'; scaling?: ChampionScaling[] }) {
   const headerColor = side === 'blue' ? 'text-blue-400/70 border-blue-500/20' : 'text-red-400/70 border-red-500/20';
+  const scalingByChamp = new Map(scaling?.map((s) => [s.champion.toLowerCase(), s]));
   return (
     <table className="w-full text-xs">
       <thead>
@@ -756,21 +770,27 @@ function ChampTable({ champs, side }: { champs: ChampionWR[]; side: 'blue' | 're
         </tr>
       </thead>
       <tbody>
-        {champs.map((c) => (
-          <tr key={c.champion} className="border-b border-gray-800/40 hover:bg-white/[0.02]">
-            <td className="px-3 py-1.5 font-medium text-white capitalize">{c.champion}</td>
-            <td className="px-3 py-1.5 text-right text-gray-500">{c.games}</td>
-            <td className="px-3 py-1.5 text-right text-gray-400 font-mono">{c.wGames || c.games}</td>
-            <td className={`px-3 py-1.5 text-right font-mono ${wrColor(c.winRate)}`}>{pct(c.winRate)}</td>
-            <td className="px-3 py-1.5 text-right text-gray-300 font-mono">
-              {c.avgKills.toFixed(1)}/{c.avgDeaths.toFixed(1)}/{c.avgAssists.toFixed(1)}
-            </td>
-            <td className={`px-3 py-1.5 text-right font-mono ${c.avgGD15 >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {c.avgGD15 >= 0 ? '+' : ''}{Math.round(c.avgGD15)}
-            </td>
-            <td className="px-3 py-1.5 text-right text-gray-400 font-mono">{Math.round(c.avgDPM)}</td>
-          </tr>
-        ))}
+        {champs.map((c) => {
+          const sc = scalingByChamp.get(c.champion.toLowerCase());
+          return (
+            <tr key={c.champion} className="border-b border-gray-800/40 hover:bg-white/[0.02]">
+              <td className="px-3 py-1.5 font-medium text-white capitalize">
+                <span className="mr-1.5">{c.champion}</span>
+                {sc && scalingTagBadge(sc.tag, sc.scalingScore)}
+              </td>
+              <td className="px-3 py-1.5 text-right text-gray-500">{c.games}</td>
+              <td className="px-3 py-1.5 text-right text-gray-400 font-mono">{c.wGames || c.games}</td>
+              <td className={`px-3 py-1.5 text-right font-mono ${wrColor(c.winRate)}`}>{pct(c.winRate)}</td>
+              <td className="px-3 py-1.5 text-right text-gray-300 font-mono">
+                {c.avgKills.toFixed(1)}/{c.avgDeaths.toFixed(1)}/{c.avgAssists.toFixed(1)}
+              </td>
+              <td className={`px-3 py-1.5 text-right font-mono ${c.avgGD15 >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {c.avgGD15 >= 0 ? '+' : ''}{Math.round(c.avgGD15)}
+              </td>
+              <td className="px-3 py-1.5 text-right text-gray-400 font-mono">{Math.round(c.avgDPM)}</td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );
@@ -873,6 +893,61 @@ function comfortColor(c: number) {
   return 'text-red-400';
 }
 
+function scalingTagBadge(tag: ChampionScaling['tag'], score: number) {
+  if (tag === 'scaling') return (
+    <span className="text-[9px] px-1 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-medium">
+      LATE +{(score * 100).toFixed(0)}
+    </span>
+  );
+  if (tag === 'early') return (
+    <span className="text-[9px] px-1 py-0.5 rounded bg-orange-500/20 text-orange-300 border border-orange-500/30 font-medium">
+      EARLY {(score * 100).toFixed(0)}
+    </span>
+  );
+  return null;
+}
+
+function ScalingTable({ scaling }: { scaling: ChampionScaling[] }) {
+  if (!scaling.length) return <div className="text-xs text-gray-600 px-3 py-2">No scaling data</div>;
+  return (
+    <table className="w-full text-xs">
+      <thead>
+        <tr className="text-left border-b border-gray-700/50 text-gray-500">
+          <th className="px-3 py-1.5 font-medium">Champion</th>
+          <th className="px-3 py-1.5 font-medium text-center">Profile</th>
+          <th className="px-3 py-1.5 font-medium text-right" title="Win rate in games shorter than 27 min">WR Early</th>
+          <th className="px-3 py-1.5 font-medium text-right" title="Win rate in games longer than 33 min">WR Late</th>
+          <th className="px-3 py-1.5 font-medium text-right" title="tanh((wrLate − wrEarly) × 8), −1..+1">Scale</th>
+        </tr>
+      </thead>
+      <tbody>
+        {scaling.map((sc) => (
+          <tr key={sc.champion} className="border-b border-gray-800/40 hover:bg-white/[0.02]">
+            <td className="px-3 py-1.5 font-medium text-white capitalize">{sc.champion}</td>
+            <td className="px-3 py-1.5 text-center">
+              {scalingTagBadge(sc.tag, sc.scalingScore)}
+            </td>
+            <td className={`px-3 py-1.5 text-right font-mono ${sc.gamesEarly >= 10 ? wrColor(sc.wrEarly) : 'text-gray-600'}`}>
+              {sc.gamesEarly >= 10 ? `${(sc.wrEarly * 100).toFixed(1)}%` : '—'}
+              {sc.gamesEarly >= 10 && <span className="text-[9px] text-gray-600 ml-1">({sc.gamesEarly}g)</span>}
+            </td>
+            <td className={`px-3 py-1.5 text-right font-mono ${sc.gamesLate >= 10 ? wrColor(sc.wrLate) : 'text-gray-600'}`}>
+              {sc.gamesLate >= 10 ? `${(sc.wrLate * 100).toFixed(1)}%` : '—'}
+              {sc.gamesLate >= 10 && <span className="text-[9px] text-gray-600 ml-1">({sc.gamesLate}g)</span>}
+            </td>
+            <td className={`px-3 py-1.5 text-right font-mono font-semibold ${
+              sc.scalingScore > 0.15 ? 'text-indigo-400' :
+              sc.scalingScore < -0.15 ? 'text-orange-400' : 'text-gray-400'
+            }`}>
+              {sc.scalingScore > 0 ? '+' : ''}{sc.scalingScore.toFixed(2)}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function MasteryTable({ mastery }: { mastery: PlayerMastery[] }) {
   if (!mastery.length) return <div className="text-xs text-gray-600 px-3 py-2">No player mastery data (enter player names above)</div>;
   return (
@@ -954,7 +1029,7 @@ export default function DraftAnalyzerPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [summary, setSummary] = useState<Summary | null>(null);
-  const [activeTab, setActiveTab] = useState<'overview' | 'matchups' | 'synergy' | 'mastery'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'matchups' | 'synergy' | 'mastery' | 'scaling'>('overview');
   const abortRef = useRef<AbortController | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
@@ -1583,13 +1658,52 @@ export default function DraftAnalyzerPage() {
               <ScoreBar label="Synergy" blue={result.blue.synergyScore} red={result.red.synergyScore} description={result.dataWindows?.synergiesMatchups ?? 'all data'} mixShare={result.scoreMixApplied?.synergy} />
               <ScoreBar label="Matchups (lane + comp)" blue={result.blue.matchupScore} red={result.red.matchupScore} description={result.dataWindows?.synergiesMatchups ?? 'all data'} mixShare={result.scoreMixApplied?.matchup} />
               <ScoreBar label="Player Mastery" blue={result.blue.masteryScore} red={result.red.masteryScore} description={result.dataWindows?.playerMastery ?? 'recent patches'} mixShare={result.scoreMixApplied?.mastery} />
+
+              {/* Scaling balance — informational only (not part of composite score) */}
+              {result.scalingBalance != null && Math.abs(result.scalingBalance) > 0.01 && (() => {
+                const bal = result.scalingBalance;
+                const favors = bal > 0.05 ? 'blue' : bal < -0.05 ? 'red' : 'even';
+                const barPct = Math.min(Math.abs(bal) * 200, 50);
+                return (
+                  <div className="space-y-1 pt-2 border-t border-gray-800/60">
+                    <div className="flex items-center justify-between text-xs gap-2">
+                      <span className="text-gray-400 font-medium shrink-0">
+                        Scaling Balance
+                        <span className="ml-1.5 text-[10px] font-normal text-gray-600">(informational · not in score)</span>
+                      </span>
+                      <span className="text-[10px] text-gray-500">
+                        {favors === 'blue' ? '📈 Blue more late-game' : favors === 'red' ? '📈 Red more late-game' : 'Even scaling'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className={`text-xs font-mono w-14 text-right ${favors === 'blue' ? 'text-indigo-400' : 'text-gray-500'}`}>
+                        {bal > 0 ? '+' : ''}{(bal * 100).toFixed(0)}
+                      </span>
+                      <div className="flex-1 h-3 bg-gray-800 rounded-full relative overflow-hidden">
+                        <div className="absolute inset-0 flex">
+                          <div className="w-1/2 flex justify-end">
+                            {favors === 'blue' && <div className="h-full bg-indigo-500/60 rounded-l-full" style={{ width: `${barPct}%` }} />}
+                          </div>
+                          <div className="w-px bg-gray-600" />
+                          <div className="w-1/2">
+                            {favors === 'red' && <div className="h-full bg-orange-500/60 rounded-r-full" style={{ width: `${barPct}%` }} />}
+                          </div>
+                        </div>
+                      </div>
+                      <span className={`text-xs font-mono w-14 ${favors === 'red' ? 'text-orange-400' : 'text-gray-500'}`}>
+                        {bal < 0 ? '+' : '-'}{(Math.abs(bal) * 100).toFixed(0)}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
           {/* Detail tabs */}
           <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
             <div className="flex border-b border-gray-800">
-              {(['overview', 'matchups', 'synergy', 'mastery'] as const).map((tab) => (
+              {(['overview', 'matchups', 'synergy', 'mastery', 'scaling'] as const).map((tab) => (
                 <button
                   key={tab}
                   onClick={() => setActiveTab(tab)}
@@ -1611,13 +1725,13 @@ export default function DraftAnalyzerPage() {
                     <div className="px-3 py-2 bg-blue-500/5 border-b border-blue-500/20">
                       <span className="text-xs font-semibold text-blue-300">Blue Champions</span>
                     </div>
-                    <ChampTable champs={result.blue.components.champions} side="blue" />
+                    <ChampTable champs={result.blue.components.champions} side="blue" scaling={result.blue.components.scaling} />
                   </div>
                   <div>
                     <div className="px-3 py-2 bg-red-500/5 border-b border-red-500/20">
                       <span className="text-xs font-semibold text-red-300">Red Champions</span>
                     </div>
-                    <ChampTable champs={result.red.components.champions} side="red" />
+                    <ChampTable champs={result.red.components.champions} side="red" scaling={result.red.components.scaling} />
                   </div>
                 </div>
               )}
@@ -1672,6 +1786,26 @@ export default function DraftAnalyzerPage() {
                       <span className="text-xs font-semibold text-red-300">Red Player Mastery</span>
                     </div>
                     <MasteryTable mastery={result.red.components.mastery} />
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'scaling' && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-gray-800">
+                  <div>
+                    <div className="px-3 py-2 bg-blue-500/5 border-b border-blue-500/20">
+                      <span className="text-xs font-semibold text-blue-300">Blue Scaling Profile</span>
+                      <span className="text-[10px] text-gray-500 ml-2">
+                        WR Early = games &lt;27 min · WR Late = games &gt;33 min · Score = tanh((late−early)×8)
+                      </span>
+                    </div>
+                    <ScalingTable scaling={result.blue.components.scaling ?? []} />
+                  </div>
+                  <div>
+                    <div className="px-3 py-2 bg-red-500/5 border-b border-red-500/20">
+                      <span className="text-xs font-semibold text-red-300">Red Scaling Profile</span>
+                    </div>
+                    <ScalingTable scaling={result.red.components.scaling ?? []} />
                   </div>
                 </div>
               )}

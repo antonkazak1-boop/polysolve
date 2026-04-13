@@ -15,6 +15,27 @@ export interface ChampionWR {
   avgDPM: number;
 }
 
+/**
+ * Empirical scaling profile for a champion, derived from WR in early vs late games.
+ *
+ * scalingScore ∈ [-1, +1]:
+ *   +1 = strong late-game scaler (WR rises significantly in long games)
+ *    0 = neutral
+ *   -1 = early-game dominant (WR falls sharply in long games)
+ *
+ * Formula: scalingScore = tanh((wrLate - wrEarly) * 8)
+ * Buckets:  early < 27 min, late >= 33 min  (27–33 is mid, excluded to sharpen signal)
+ */
+export interface ChampionScaling {
+  champion: string;
+  scalingScore: number;   // tanh-compressed, -1..+1
+  wrEarly: number;        // WR in games < 27 min
+  wrLate: number;         // WR in games >= 33 min
+  gamesEarly: number;
+  gamesLate: number;
+  tag: 'scaling' | 'early' | 'neutral';
+}
+
 export interface SynergyPair {
   champA: string;
   champB: string;
@@ -67,12 +88,15 @@ export interface DraftScore {
   synergyScore: number;
   matchupScore: number;
   masteryScore: number;
+  /** Avg scaling score for this side's champions; -1..+1. Not part of totalScore — informational. */
+  scalingScore: number;
   totalScore: number;
   components: {
     champions: ChampionWR[];
     synergies: SynergyPair[];
     matchups: MatchupStat[];
     mastery: PlayerChampionMastery[];
+    scaling: ChampionScaling[];
   };
 }
 
@@ -98,6 +122,12 @@ export interface DraftAnalysisResult {
   blueWinProbability: number;
   advantage: 'BLUE' | 'RED' | 'EVEN';
   advantageMargin: number;
+  /**
+   * Scaling balance = blue.scalingScore - red.scalingScore, clamped to [-1, +1].
+   * Positive = Blue has more late-game champions, negative = Red is more early.
+   * Shown in UI as a standalone indicator; does not affect totalScore directly.
+   */
+  scalingBalance: number;
   patchesUsed: string[];
   gamesAnalyzed: number;
   weightsApplied: DraftWeightsConfig;
@@ -275,6 +305,78 @@ function computeRawComfort(games: number, winRate: number, kda: number, totalPla
 /** Comfort when player has no recorded pro games on the drafted champion (counts in mastery average). */
 export const DRAFT_MIN_COMFORT_COEFF = 0.05;
 
+// ─── Champion scaling by game length ─────────────────────────────────────────
+// Cache (TTL 30 min) since this query scans the full player-game table.
+
+let scalingCache: Map<string, ChampionScaling> | null = null;
+let scalingCacheTs = 0;
+const SCALING_CACHE_TTL = 30 * 60 * 1000;
+
+// Game-length buckets in seconds: early < 1620 (27 min), late >= 1980 (33 min).
+const EARLY_MAX_SEC = 27 * 60;
+const LATE_MIN_SEC = 33 * 60;
+const SCALING_MIN_GAMES = 10; // min games per bucket to trust the WR
+
+/**
+ * For every champion with enough data, compute a continuous scaling score:
+ *   scalingScore = tanh((wrLate - wrEarly) * 8)  ∈ [-1, +1]
+ *
+ * We query OEPlayerGame joined to OEGame.gamelength to bucket games.
+ * Result is cached for SCALING_CACHE_TTL.
+ */
+export async function getChampionScaling(): Promise<Map<string, ChampionScaling>> {
+  const now = Date.now();
+  if (scalingCache && now - scalingCacheTs < SCALING_CACHE_TTL) return scalingCache;
+
+  const rows = await prisma.oEPlayerGame.findMany({
+    select: {
+      champion: true,
+      result: true,
+      game: { select: { gamelength: true } },
+    },
+    where: { position: { not: 'team' } },
+  });
+
+  // Accumulate wins/games per champion per bucket.
+  const acc = new Map<string, { earlyW: number; earlyN: number; lateW: number; lateN: number }>();
+  for (const r of rows) {
+    const sec = r.game.gamelength;
+    if (sec == null) continue;
+    const key = r.champion.toLowerCase();
+    const s = acc.get(key) ?? { earlyW: 0, earlyN: 0, lateW: 0, lateN: 0 };
+    if (sec < EARLY_MAX_SEC) {
+      s.earlyN++;
+      if (r.result === 1) s.earlyW++;
+    } else if (sec >= LATE_MIN_SEC) {
+      s.lateN++;
+      if (r.result === 1) s.lateW++;
+    }
+    acc.set(key, s);
+  }
+
+  const result = new Map<string, ChampionScaling>();
+  for (const [champ, s] of acc) {
+    if (s.earlyN < SCALING_MIN_GAMES || s.lateN < SCALING_MIN_GAMES) continue;
+    const wrEarly = s.earlyW / s.earlyN;
+    const wrLate = s.lateW / s.lateN;
+    const slope = wrLate - wrEarly;
+    const scalingScore = Math.tanh(slope * 8);
+    const tag: ChampionScaling['tag'] =
+      scalingScore > 0.15 ? 'scaling' :
+      scalingScore < -0.15 ? 'early' : 'neutral';
+    result.set(champ, {
+      champion: champ, scalingScore: Math.round(scalingScore * 1000) / 1000,
+      wrEarly: Math.round(wrEarly * 10000) / 10000,
+      wrLate: Math.round(wrLate * 10000) / 10000,
+      gamesEarly: s.earlyN, gamesLate: s.lateN, tag,
+    });
+  }
+
+  scalingCache = result;
+  scalingCacheTs = now;
+  return result;
+}
+
 // ─── Patch filter helpers ────────────────────────────────────────────────────
 
 function recentPatches(count: number = 5): Promise<string[]> {
@@ -439,7 +541,7 @@ export async function getLaneMatchups(minGames: number = 1, weights?: Partial<Dr
       for (const me of myTeam) {
         const w = gameWeight(me.game.league, me.game.year, cfg);
         for (const opp of oppTeam) {
-          const key = `${me.champion.toLowerCase()}|${opp.champion.toLowerCase()}|${me.position}`;
+          const key = `${me.champion.toLowerCase()}|${opp.champion.toLowerCase()}|${me.position}|${opp.position}`;
           const s = matchupStats.get(key) ?? { wGames: 0, wWins: 0, rawGames: 0, rawWins: 0, wGd15: 0, wCsd15: 0, wXpd15: 0, wStatCount: 0, oppPos: opp.position };
           s.wGames += w;
           s.rawGames++;
@@ -450,7 +552,6 @@ export async function getLaneMatchups(minGames: number = 1, weights?: Partial<Dr
             s.wXpd15 += (me.xpdiffat15 ?? 0) * w;
             s.wStatCount += w;
           }
-          s.oppPos = opp.position;
           matchupStats.set(key, s);
         }
       }
@@ -463,12 +564,12 @@ export async function getLaneMatchups(minGames: number = 1, weights?: Partial<Dr
   const result = new Map<string, MatchupStat>();
   for (const [key, s] of matchupStats) {
     if (s.rawGames < minGames) continue;
-    const [champ, opp, pos] = key.split('|');
+    const [champ, opp, pos, oppPos] = key.split('|');
     const wr = s.wGames > 0 ? s.wWins / s.wGames : 0.5;
     const avgGD15 = s.wStatCount > 0 ? s.wGd15 / s.wStatCount : 0;
     const avgCSD15 = s.wStatCount > 0 ? s.wCsd15 / s.wStatCount : 0;
     const avgXPD15 = s.wStatCount > 0 ? s.wXpd15 / s.wStatCount : 0;
-    const isLane = pos === s.oppPos;
+    const isLane = pos === oppPos;
 
     let scalingTag: 'early' | 'scaling' | 'neutral' = 'neutral';
     if (isLane) {
@@ -482,7 +583,7 @@ export async function getLaneMatchups(minGames: number = 1, weights?: Partial<Dr
 
     result.set(key, {
       champion: champ, opponent: opp, position: pos,
-      opponentPosition: s.oppPos,
+      opponentPosition: oppPos,
       kind: isLane ? 'lane' : 'cross',
       games: s.rawGames, wins: s.rawWins,
       winRate: wr, avgGD15, avgCSD15, avgXPD15,
@@ -558,6 +659,8 @@ export async function getPlayerMastery(playerNames: string[], weights?: Partial<
       const wr = s.wGames > 0 ? s.wWins / s.wGames : 0.5;
       const rawWr = s.rawGames > 0 ? s.rawWins / s.rawGames : 0.5;
 
+      const rawComfort = computeRawComfort(s.rawGames, rawWr, kda, totalPlayerGames);
+      const conf = sampleConfidence(s.rawGames, G_MASTERY_FULL);
       masteries.push({
         player, champion: champ,
         games: s.rawGames, wins: s.rawWins,
@@ -567,7 +670,7 @@ export async function getPlayerMastery(playerNames: string[], weights?: Partial<
         avgDPM: s.dpmCount > 0 ? Math.round(s.dpm / s.dpmCount) : 0,
         avgCSPM: s.cspmCount > 0 ? Math.round((s.cspm / s.cspmCount) * 10) / 10 : 0,
         wrDelta: Math.round((wr - playerAvgWR) * 10000) / 10000,
-        comfortCoeff: computeRawComfort(s.rawGames, rawWr, kda, totalPlayerGames),
+        comfortCoeff: rawComfort * conf,
       });
     }
 
@@ -660,12 +763,13 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
   const metaPatches = await recentPatches(5);
   const wSummary = formatWeightsSummary(weights);
 
-  const [champWRs, synergies, matchups, blueMastery, redMastery] = await Promise.all([
+  const [champWRs, synergies, matchups, blueMastery, redMastery, scalingMap] = await Promise.all([
     getChampionWinRates(metaPatches, 5, weights),
     getChampionSynergies(2, weights),
     getLaneMatchups(1, weights),
     bluePlayers ? getPlayerMastery(bluePlayers, weights) : Promise.resolve(new Map()),
     redPlayers ? getPlayerMastery(redPlayers, weights) : Promise.resolve(new Map()),
+    getChampionScaling(),
   ]);
 
   for (const [, syn] of synergies) {
@@ -681,7 +785,7 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
     players: string[] | undefined,
     masteryMap: Map<string, PlayerChampionMastery[]>,
     mix: DraftScoreMixNormalized,
-  ): DraftScore {
+  ): Omit<DraftScore, 'teamSide'> {
     const champKeys = champs.map((c) => c.toLowerCase());
     const oppKeys = oppChamps.map((c) => c.toLowerCase());
 
@@ -717,11 +821,11 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
     let muWeightTotal = 0;
     for (let i = 0; i < champKeys.length; i++) {
       for (let j = 0; j < oppKeys.length; j++) {
-        const key = `${champKeys[i]}|${oppKeys[j]}|${positions[i]}`;
+        const key = `${champKeys[i]}|${oppKeys[j]}|${positions[i]}|${positions[j]}`;
         const mu = matchups.get(key);
         if (!mu) continue;
         matchupList.push(mu);
-        const posWeight = i === j ? W_LANE : W_CROSS;
+        const posWeight = mu.kind === 'lane' ? W_LANE : W_CROSS;
         const conf = sampleConfidence(mu.games, N_REF_MATCHUP);
         muWeightedSum += mu.adjustedAdvantage * posWeight * conf;
         muWeightTotal += posWeight * conf;
@@ -775,6 +879,23 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
       masteryScore = wTotal > 0 ? wSum / wTotal : 0;
     }
 
+    // Scaling: collect ChampionScaling entries for this side.
+    const scalingList: ChampionScaling[] = champKeys.map((k) =>
+      scalingMap.get(k) ?? {
+        champion: k, scalingScore: 0, wrEarly: 0.5, wrLate: 0.5,
+        gamesEarly: 0, gamesLate: 0, tag: 'neutral' as const,
+      },
+    );
+    // Average scaling score for this side (confidence-weighted by min(gamesEarly, gamesLate) / 50).
+    let scalingSumW = 0;
+    let scalingTotalW = 0;
+    for (const sc of scalingList) {
+      const conf = Math.min(1, Math.min(sc.gamesEarly, sc.gamesLate) / 50);
+      scalingSumW += sc.scalingScore * conf;
+      scalingTotalW += conf;
+    }
+    const scalingScore = scalingTotalW > 0 ? Math.round((scalingSumW / scalingTotalW) * 1000) / 1000 : 0;
+
     const raw = championTier * mix.championTier
       + (0.5 + synergyScore) * mix.synergy
       + (0.5 + matchupScore) * mix.matchup
@@ -782,19 +903,24 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
     const totalScore = Math.round(raw * 10000) / 10000;
 
     return {
-      teamSide: '', championTier: Math.round(championTier * 10000) / 10000,
+      championTier: Math.round(championTier * 10000) / 10000,
       synergyScore: Math.round(synergyScore * 10000) / 10000,
       matchupScore: Math.round(matchupScore * 10000) / 10000,
       masteryScore: Math.round(masteryScore * 10000) / 10000,
+      scalingScore,
       totalScore,
-      components: { champions: champData, synergies: synergyPairs, matchups: matchupList, mastery: masteryList },
+      components: { champions: champData, synergies: synergyPairs, matchups: matchupList, mastery: masteryList, scaling: scalingList },
     };
   }
 
-  const blue = scoreSide(input.blueChamps, input.redChamps, bluePlayers, blueMastery, scoreMix);
-  blue.teamSide = 'Blue';
-  const red = scoreSide(input.redChamps, input.blueChamps, redPlayers, redMastery, scoreMix);
-  red.teamSide = 'Red';
+  const blueRaw = scoreSide(input.blueChamps, input.redChamps, bluePlayers, blueMastery, scoreMix);
+  const redRaw = scoreSide(input.redChamps, input.blueChamps, redPlayers, redMastery, scoreMix);
+  const blue: DraftScore = { teamSide: 'Blue', ...blueRaw };
+  const red: DraftScore = { teamSide: 'Red', ...redRaw };
+
+  const scalingBalance = Math.round(
+    Math.max(-1, Math.min(1, blue.scalingScore - red.scalingScore)) * 1000,
+  ) / 1000;
 
   const scoreDiff = blue.totalScore - red.totalScore;
   const blueWinP = 1 / (1 + Math.exp(-scoreDiff * 15));
@@ -805,6 +931,7 @@ export async function analyzeDraft(input: DraftInput): Promise<DraftAnalysisResu
     blue, red,
     blueWinProbability: Math.round(blueWinP * 10000) / 10000,
     advantage, advantageMargin: Math.round(margin * 10000) / 10000,
+    scalingBalance,
     patchesUsed: metaPatches, gamesAnalyzed,
     weightsApplied: weights,
     scoreMixApplied: scoreMix,

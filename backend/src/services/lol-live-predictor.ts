@@ -1,4 +1,5 @@
 import prisma from '../config/database';
+import { getChampionScaling } from './draft-analysis';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -35,9 +36,16 @@ export interface LiveGameState {
   blueTowersDestroyed: number;
   redTowersDestroyed: number;
 
-  killDiff?: number;
-
   draftPMap?: number;
+}
+
+/** How historical gold→win curves were built for this prediction. */
+export interface LiveGoldModelMeta {
+  source: 'gol.gg' | 'oracle_elixir';
+  /** Games used to build the gold model (gol.gg: snapshots with gold+winner; OE: season games). */
+  sampleGames: number;
+  /** Distinct game minutes with at least one curve point (gol.gg: 0..N; OE: 4 fixed). */
+  minutesCovered: number;
 }
 
 export interface LivePrediction {
@@ -46,10 +54,16 @@ export interface LivePrediction {
     draftBaseline: number;
     goldWR: number;
     goldShift: number;
+    /** Share of draft in the gold step blend: pAfterGold = draft*this + goldWR*(1-this). */
+    draftAnchorWeight: number;
+    /** Minute index used for gold→WR lookup (capped; late game relies on draft not sparse gold curves). */
+    goldLookupMinute: number;
+    /** 0–1: historical gold→WR muted toward draft (linear 30→40m; 40m+ = 1). */
+    goldHistoricalMute: number;
     objectiveShift: number;
     scalingShift: number;
-    killShift: number;
     objectives: ObjectiveBreakdown;
+    goldModel: LiveGoldModelMeta;
   };
   minute: number;
 }
@@ -96,28 +110,40 @@ export interface ObjectiveStats {
 
 const CURRENT_YEAR = 2026;
 const CACHE_TTL = 10 * 60 * 1000;
-const GOLD_BUCKETS = [-8000, -5000, -3000, -1500, -500, 500, 1500, 3000, 5000, 8000];
-const SCALE_PER_MINUTE = 0.001;
+const OE_GOLD_BUCKETS = [-8000, -5000, -3000, -1500, -500, 500, 1500, 3000, 5000, 8000];
+const SCALE_PER_MINUTE = 0.0015;
 
 // ─── Cache ───────────────────────────────────────────────────────────────────
 
-let goldCurvesCache: GoldCurveData[] | null = null;
-let goldCurvesTs = 0;
+let oeGoldCache: { curves: GoldCurveData[]; sampleGames: number } | null = null;
+let oeGoldCacheTs = 0;
+let golGgGoldCurvesCache: { curves: GoldCurveData[]; usableGames: number } | null = null;
+let golGgGoldCurvesTs = 0;
 let objectiveStatsCache: ObjectiveStats | null = null;
 let objectiveStatsTs = 0;
 
 // ─── Gold-to-WR Curves ──────────────────────────────────────────────────────
 
-function bucketize(goldDiff: number): number {
-  for (let i = 0; i < GOLD_BUCKETS.length; i++) {
-    if (goldDiff < GOLD_BUCKETS[i]) return GOLD_BUCKETS[i];
+/**
+ * Snap goldDiff to the nearest bucket midpoint.
+ * E.g. with midpoints [..., -1000, 0, 1000, ...], goldDiff=400 → bucket 0, goldDiff=600 → bucket 1000.
+ */
+function bucketize(goldDiff: number, midpoints: number[]): number {
+  let best = midpoints[0];
+  let bestDist = Math.abs(goldDiff - midpoints[0]);
+  for (let i = 1; i < midpoints.length; i++) {
+    const d = Math.abs(goldDiff - midpoints[i]);
+    if (d < bestDist) { best = midpoints[i]; bestDist = d; }
   }
-  return 12000;
+  return best;
 }
 
-export async function buildGoldCurves(): Promise<GoldCurveData[]> {
+/** OE-based gold curves (fallback: only 10/15/20/25 min) */
+async function buildOEGoldCurves(): Promise<{ curves: GoldCurveData[]; sampleGames: number }> {
   const now = Date.now();
-  if (goldCurvesCache && now - goldCurvesTs < CACHE_TTL) return goldCurvesCache;
+  if (oeGoldCache && now - oeGoldCacheTs < CACHE_TTL) {
+    return oeGoldCache;
+  }
 
   const games = await prisma.oEGame.findMany({
     where: { year: CURRENT_YEAR },
@@ -140,21 +166,21 @@ export async function buildGoldCurves(): Promise<GoldCurveData[]> {
   const curves: GoldCurveData[] = [];
 
   for (const { minute, field } of minuteFields) {
-    const buckets = new Map<number, { wins: number; total: number }>();
+    const bMap = new Map<number, { wins: number; total: number }>();
 
     for (const g of games) {
       const gd = g[field] as number | null;
       if (gd == null) continue;
-      const bucket = bucketize(gd);
-      const entry = buckets.get(bucket) ?? { wins: 0, total: 0 };
+      const b = bucketize(gd, OE_GOLD_BUCKETS);
+      const entry = bMap.get(b) ?? { wins: 0, total: 0 };
       entry.total++;
       if (g.blueResult === 1) entry.wins++;
-      buckets.set(bucket, entry);
+      bMap.set(b, entry);
     }
 
     const points: GoldCurvePoint[] = [];
-    for (const b of [...GOLD_BUCKETS, 12000]) {
-      const entry = buckets.get(b);
+    for (const b of OE_GOLD_BUCKETS) {
+      const entry = bMap.get(b);
       if (!entry || entry.total < 3) continue;
       points.push({
         goldDiffBucket: b,
@@ -166,9 +192,131 @@ export async function buildGoldCurves(): Promise<GoldCurveData[]> {
     curves.push({ minute, points });
   }
 
-  goldCurvesCache = curves;
-  goldCurvesTs = now;
-  return curves;
+  oeGoldCache = { curves, sampleGames: games.length };
+  oeGoldCacheTs = now;
+  return oeGoldCache;
+}
+
+/**
+ * Build gold-to-WR curves from gol.gg per-minute gold data.
+ * Each GolGgGameSnapshot has goldOverTime with per-minute gold lead (blue-red)
+ * and winnerSide (blue/red). This gives us real data for EVERY minute.
+ */
+export async function buildGolGgGoldCurves(): Promise<{ curves: GoldCurveData[]; usableGames: number }> {
+  const now = Date.now();
+  if (golGgGoldCurvesCache && now - golGgGoldCurvesTs < CACHE_TTL) return golGgGoldCurvesCache;
+
+  const snapshots = await prisma.golGgGameSnapshot.findMany({
+    where: { pageSlug: 'page-game' },
+    select: { meta: true, charts: true },
+  });
+
+  // Midpoint-centered buckets: 0 = goldDiff ≈ 0, 1000 = goldDiff ≈ 500..1500, etc.
+  const GOLGG_BUCKETS = [-10000, -6000, -4000, -2500, -1500, -1000, -500, 0, 500, 1000, 1500, 2500, 4000, 6000, 10000];
+
+  // Collect per-minute stats: minute -> bucket -> {wins, total}
+  const minuteData = new Map<number, Map<number, { wins: number; total: number }>>();
+
+  let usableGames = 0;
+
+  for (const snap of snapshots) {
+    let meta: any, charts: any;
+    try {
+      meta = JSON.parse(snap.meta as string);
+      charts = JSON.parse(snap.charts as string);
+    } catch { continue; }
+
+    const winnerSide = meta.winnerSide as string | null;
+    if (!winnerSide || (winnerSide !== 'blue' && winnerSide !== 'red')) continue;
+
+    const goldData = charts.goldOverTime?.datasets?.[1]?.data as number[] | undefined;
+    if (!goldData || goldData.length < 5) continue;
+
+    const blueWin = winnerSide === 'blue' ? 1 : 0;
+    usableGames++;
+
+    for (let minute = 0; minute < goldData.length; minute++) {
+      const goldDiff = goldData[minute]; // positive = blue leads
+      if (typeof goldDiff !== 'number') continue;
+
+      const b = bucketize(goldDiff, GOLGG_BUCKETS);
+
+      if (!minuteData.has(minute)) minuteData.set(minute, new Map());
+      const bMap = minuteData.get(minute)!;
+      const entry = bMap.get(b) ?? { wins: 0, total: 0 };
+      entry.total++;
+      entry.wins += blueWin;
+      bMap.set(b, entry);
+    }
+  }
+
+  const MIN_GAMES = 8;
+  // Bayesian smoothing: blend toward 50% for small samples.
+  // With PRIOR_WEIGHT=5, a bucket with 5 games at 100% WR → smoothed to ~72%.
+  const PRIOR_WEIGHT = 5;
+
+  const curves: GoldCurveData[] = [];
+
+  for (const [minute, bMap] of minuteData) {
+    const points: GoldCurvePoint[] = [];
+    for (const b of GOLGG_BUCKETS) {
+      const entry = bMap.get(b);
+      if (!entry || entry.total < MIN_GAMES) continue;
+      const smoothedWR = (entry.wins + PRIOR_WEIGHT * 0.5) / (entry.total + PRIOR_WEIGHT);
+      points.push({
+        goldDiffBucket: b,
+        blueWinRate: smoothedWR,
+        games: entry.total,
+      });
+    }
+    if (points.length < 2) continue;
+    points.sort((a, b) => a.goldDiffBucket - b.goldDiffBucket);
+    curves.push({ minute, points });
+  }
+
+  curves.sort((a, b) => a.minute - b.minute);
+  const payload = { curves, usableGames };
+  golGgGoldCurvesCache = payload;
+  golGgGoldCurvesTs = now;
+  return payload;
+}
+
+/** Prefer gol.gg per-minute gold+winner data; fall back to Oracle's Elixir if sample is too thin. */
+const GOLGG_MIN_USABLE_GAMES = 200;
+const GOLGG_MIN_MINUTE_CURVES = 15;
+
+/**
+ * Gold curves + metadata for live predictor and API.
+ */
+export async function buildGoldCurves(): Promise<{
+  curves: GoldCurveData[];
+  goldModel: LiveGoldModelMeta;
+}> {
+  const gol = await buildGolGgGoldCurves();
+  const useGolGg =
+    gol.usableGames >= GOLGG_MIN_USABLE_GAMES &&
+    gol.curves.length >= GOLGG_MIN_MINUTE_CURVES;
+
+  if (useGolGg) {
+    return {
+      curves: gol.curves,
+      goldModel: {
+        source: 'gol.gg',
+        sampleGames: gol.usableGames,
+        minutesCovered: gol.curves.length,
+      },
+    };
+  }
+
+  const oe = await buildOEGoldCurves();
+  return {
+    curves: oe.curves,
+    goldModel: {
+      source: 'oracle_elixir',
+      sampleGames: oe.sampleGames,
+      minutesCovered: oe.curves.length,
+    },
+  };
 }
 
 function interpolateGoldWR(curves: GoldCurveData[], minute: number, goldDiff: number): number {
@@ -188,7 +336,38 @@ function interpolateGoldWR(curves: GoldCurveData[], minute: number, goldDiff: nu
     return 0.5;
   };
 
-  // Find the two nearest minute curves and interpolate
+  // gol.gg: one curve per minute; single-minute WR is noisy. Nearest-only still zig-zags (24→25→26).
+  // 5-minute centered average of WR at same gold diff smooths per-minute noise without state.
+  const densePerMinute = curves.length >= 12;
+  if (densePerMinute) {
+    const nearestTo = (target: number): GoldCurveData => {
+      let best = curves[0];
+      let bestDist = Math.abs(curves[0].minute - target);
+      for (let i = 1; i < curves.length; i++) {
+        const c = curves[i];
+        const d = Math.abs(c.minute - target);
+        if (d < bestDist || (d === bestDist && c.minute < best.minute)) {
+          best = c;
+          bestDist = d;
+        }
+      }
+      return best;
+    };
+    const seen = new Set<number>();
+    let sum = 0;
+    let n = 0;
+    for (const tm of [minute - 2, minute - 1, minute, minute + 1, minute + 2]) {
+      if (tm < 0) continue;
+      const c = nearestTo(tm);
+      if (seen.has(c.minute)) continue;
+      seen.add(c.minute);
+      sum += findWR(c, goldDiff);
+      n++;
+    }
+    return n > 0 ? sum / n : 0.5;
+  }
+
+  // Oracle's Elixir: only 10/15/20/25 — keep linear blend between bracketing minutes.
   let lower: GoldCurveData | null = null;
   let upper: GoldCurveData | null = null;
   for (const c of curves) {
@@ -205,6 +384,40 @@ function interpolateGoldWR(curves: GoldCurveData[], minute: number, goldDiff: nu
   const wrUpper = findWR(upper, goldDiff);
   const t = (minute - lower.minute) / (upper.minute - lower.minute);
   return wrLower + t * (wrUpper - wrLower);
+}
+
+// ─── Additive model helpers ──────────────────────────────────────────────────
+//
+// Architecture: pBlue = base + goldDelta + objectiveDelta + scalingDelta
+//   base          = draftPMap, slowly fading toward 50% over the game (but never reaching 50/50)
+//   goldDelta     = shift from historical gold curves, fading toward 0 as game goes on
+//   objectiveDelta= shift from objectives (dragons, baron, grubs, herald, towers)
+//   scalingDelta  = grows with time based on champion scaling profiles
+
+/** Cap gold curve lookup at 35m — per-minute buckets thin out beyond that. */
+const GOLD_LOOKUP_MINUTE_CAP = 35;
+
+/**
+ * Team strength fade: draft/team baseline slowly fades toward 50% over the game.
+ * Even at 60min a 60% favorite is still ~56%, never truly 50/50.
+ * Returns a factor 0..1 where 0 = full baseline, 1 = fully at 50%.
+ */
+function baselineFade(minute: number): number {
+  // 0m→0%, 20m→10%, 40m→25%, 60m→35%  (never exceeds ~40%)
+  const m = Math.max(0, minute);
+  return Math.min(0.40, m * 0.006);
+}
+
+/**
+ * Gold impact multiplier: how much of the raw gold delta to apply.
+ * Full early, fading toward 0 in late game.
+ * 0–10m: 100%, 15m: 90%, 25m: 70%, 35m: 45%, 45m: 15%, 55m+: 0%
+ */
+function goldImpact(minute: number): number {
+  const m = Math.max(0, minute);
+  if (m <= 10) return 1.0;
+  if (m >= 55) return 0.0;
+  return 1.0 - (m - 10) / 45;  // linear fade 10→55m
 }
 
 // ─── Objective WR Stats ──────────────────────────────────────────────────────
@@ -357,39 +570,22 @@ export async function buildObjectiveStats(): Promise<ObjectiveStats> {
 }
 
 // ─── Scaling ─────────────────────────────────────────────────────────────────
-
-function getChampScalingCoeff(champWR: number, champGD15: number): number {
-  if (champGD15 < -100 && champWR > 0.5) return 1;   // scaling
-  if (champGD15 > 200 && champWR < 0.5) return -1;    // early
-  return 0;                                             // neutral
-}
+// Uses empirical WR-by-game-length from draft-analysis (continuous tanh score).
+// scalingScore ∈ [-1, +1]: +1 = strong scaler, -1 = early-game dominant.
 
 async function computeScalingScore(champs: string[]): Promise<number> {
   if (champs.length === 0) return 0;
-
-  const rows = await prisma.oEPlayerGame.groupBy({
-    by: ['champion'],
-    where: {
-      champion: { in: champs },
-      game: { year: CURRENT_YEAR },
-    },
-    _avg: { golddiffat15: true },
-    _count: { result: true },
-    _sum: { result: true },
-  });
-
-  let totalCoeff = 0;
-  let found = 0;
+  const scalingMap = await getChampionScaling();
+  let sumW = 0;
+  let totalW = 0;
   for (const champ of champs) {
-    const row = rows.find(r => r.champion.toLowerCase() === champ.toLowerCase());
-    if (!row || row._count.result < 5) continue;
-    const wr = (row._sum.result ?? 0) / row._count.result;
-    const gd15 = row._avg.golddiffat15 ?? 0;
-    totalCoeff += getChampScalingCoeff(wr, gd15);
-    found++;
+    const sc = scalingMap.get(champ.toLowerCase());
+    if (!sc) continue;
+    const conf = Math.min(1, Math.min(sc.gamesEarly, sc.gamesLate) / 50);
+    sumW += sc.scalingScore * conf;
+    totalW += conf;
   }
-
-  return found > 0 ? totalCoeff / found : 0;
+  return totalW > 0 ? sumW / totalW : 0;
 }
 
 // ─── Main Predict ────────────────────────────────────────────────────────────
@@ -414,26 +610,33 @@ function lookupObjectiveDelta(
 }
 
 export async function predictLive(state: LiveGameState): Promise<LivePrediction> {
-  const [curves, objStats] = await Promise.all([
+  const [{ curves, goldModel }, objStats] = await Promise.all([
     buildGoldCurves(),
     buildObjectiveStats(),
   ]);
 
   const draftBaseline = state.draftPMap != null ? Math.max(0.02, Math.min(0.98, state.draftPMap)) : 0.5;
 
-  // Gold WR from historical curves
-  // Before minute 3 (no meaningful gold diff), rely on draft baseline
-  let goldWR: number;
-  let pAfterGold: number;
-  if (state.minute < 3 && Math.abs(state.goldDiffTotal) < 200) {
-    goldWR = draftBaseline;
-    pAfterGold = draftBaseline;
-  } else {
-    goldWR = interpolateGoldWR(curves, state.minute, state.goldDiffTotal);
-    const draftWeight = Math.max(0.1, 0.6 - state.minute * 0.012);
-    pAfterGold = draftBaseline * draftWeight + goldWR * (1 - draftWeight);
+  // ── 1. BASE: draft + team strength, slowly fading toward 50% ──
+  const fade = baselineFade(state.minute);
+  const base = draftBaseline + (0.5 - draftBaseline) * fade;
+
+  // ── 2. GOLD DELTA: historical curve shift, fading toward 0 over time ──
+  // Raw historical delta is based on average-strength teams. For teams far from 50%,
+  // the actual gold impact is somewhat smaller (a strong team losing 500g is less
+  // meaningful than a weak team losing 500g). We scale by 0.55 to avoid gold
+  // overpowering the baseline. This keeps a 61% favorite at ~57% with -500g at 5m.
+  const GOLD_SCALE = 0.55;
+  const goldLookupMinute = Math.min(state.minute, GOLD_LOOKUP_MINUTE_CAP);
+  const gImpact = goldImpact(state.minute);
+  let goldShiftRaw = 0;
+  if (state.goldDiffTotal !== 0 || state.minute >= 3) {
+    const rawGoldWR = interpolateGoldWR(curves, goldLookupMinute, state.goldDiffTotal);
+    const neutralGoldWR = interpolateGoldWR(curves, goldLookupMinute, 0);
+    goldShiftRaw = rawGoldWR - neutralGoldWR;
   }
-  const goldShift = pAfterGold - draftBaseline;
+  const goldShift = goldShiftRaw * gImpact * GOLD_SCALE;
+  const goldWR = base + goldShift;
 
   // Objective shifts (all from blue-side perspective)
   const dragonDiff = state.blueDragons.length - state.redDragons.length;
@@ -507,11 +710,6 @@ export async function predictLive(state: LiveGameState): Promise<LivePrediction>
     towerDelta * 0.5
   );
 
-  // Kill diff shift — each kill advantage is worth ~0.6% WR, dampened because it correlates with gold
-  const KILL_SHIFT_PER_KILL = 0.006;
-  const killDiff = state.killDiff ?? 0;
-  const killShift = killDiff * KILL_SHIFT_PER_KILL;
-
   // Scaling shift
   const [blueScaling, redScaling] = await Promise.all([
     computeScalingScore(state.blueChamps),
@@ -520,37 +718,44 @@ export async function predictLive(state: LiveGameState): Promise<LivePrediction>
   const netScaling = blueScaling - redScaling;
   const scalingShift = netScaling * state.minute * SCALE_PER_MINUTE;
 
-  const pFinal = Math.max(0.02, Math.min(0.98, pAfterGold + objectiveShift + scalingShift + killShift));
+  // ── FINAL: base + all deltas ──
+  const pFinal = Math.max(0.02, Math.min(0.98, base + goldShift + objectiveShift + scalingShift));
 
+  const r4 = (v: number) => Math.round(v * 10000) / 10000;
   return {
-    pBlue: Math.round(pFinal * 10000) / 10000,
+    pBlue: r4(pFinal),
     breakdown: {
-      draftBaseline,
-      goldWR: Math.round(goldWR * 10000) / 10000,
-      goldShift: Math.round(goldShift * 10000) / 10000,
-      objectiveShift: Math.round(objectiveShift * 10000) / 10000,
-      killShift: Math.round(killShift * 10000) / 10000,
-      scalingShift: Math.round(scalingShift * 10000) / 10000,
+      draftBaseline: r4(draftBaseline),
+      goldWR: r4(goldWR),
+      goldShift: r4(goldShift),
+      draftAnchorWeight: r4(1 - fade),
+      goldLookupMinute,
+      goldHistoricalMute: r4(1 - gImpact),
+      objectiveShift: r4(objectiveShift),
+      scalingShift: r4(scalingShift),
       objectives: {
-        firstDragon: Math.round(firstDragonDelta * 0.3 * 10000) / 10000,
-        dragonCount: Math.round(dragonCountDelta * 0.5 * 10000) / 10000,
-        dragonSoul: Math.round(soulDelta * 0.8 * 10000) / 10000,
-        elder: Math.round(elderDelta * 0.9 * 10000) / 10000,
-        firstBaron: Math.round(firstBaronDelta * 0.4 * 10000) / 10000,
-        baronCount: Math.round(baronDelta * 0.5 * 10000) / 10000,
-        firstHerald: Math.round(firstHeraldDelta * 0.3 * 10000) / 10000,
-        heraldCount: Math.round(heraldDelta * 0.3 * 10000) / 10000,
-        grubAdvantage: Math.round(grubDelta * 0.4 * 10000) / 10000,
-        towerDiff: Math.round(towerDelta * 0.5 * 10000) / 10000,
+        firstDragon: r4(firstDragonDelta * 0.3),
+        dragonCount: r4(dragonCountDelta * 0.5),
+        dragonSoul: r4(soulDelta * 0.8),
+        elder: r4(elderDelta * 0.9),
+        firstBaron: r4(firstBaronDelta * 0.4),
+        baronCount: r4(baronDelta * 0.5),
+        firstHerald: r4(firstHeraldDelta * 0.3),
+        heraldCount: r4(heraldDelta * 0.3),
+        grubAdvantage: r4(grubDelta * 0.4),
+        towerDiff: r4(towerDelta * 0.5),
       },
+      goldModel,
     },
     minute: state.minute,
   };
 }
 
 export function invalidateLiveCache() {
-  goldCurvesCache = null;
-  goldCurvesTs = 0;
+  oeGoldCache = null;
+  oeGoldCacheTs = 0;
+  golGgGoldCurvesCache = null;
+  golGgGoldCurvesTs = 0;
   objectiveStatsCache = null;
   objectiveStatsTs = 0;
 }
